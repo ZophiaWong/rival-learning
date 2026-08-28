@@ -35,6 +35,20 @@
 
 ## Ordered implementation steps
 
+### 0. 完成 Foundation review-remediation entry gate
+
+在接入真实 provider 前修复 Foundation review 中已确认的 transport、幂等与验收缺口；该步骤使用独立 PR，且不得引入 Agents SDK、OpenRouter Adapter 或面试核心循环。
+
+**完成标准**：
+
+- 所有 `/api` route 拒绝非 loopback Host；写请求拒绝缺失或不同源 Origin。
+- 外部 HTTP body、action 与 `Idempotency-Key` 使用 Zod runtime validation，错误稳定映射为 400/403。
+- Session 创建由客户端提供 UUID identity；相同 key 与相同 command 重放第一次终态结果，不同 command/payload 使用同一 key 时返回 typed conflict。
+- `DispatchResult` 文档与实现统一为原结果重放；前端使用 canonical `PreparationProfile` 类型。
+- `/events` 保持 SSE 连接，按 `Last-Event-ID` 续读并由 UI 去重，断开时释放轮询与心跳资源。
+- secret canary tests 覆盖序列化 response、header 与 log；`contact-v1` 保持不变，其已知限制由 GitHub Issue 跟踪。
+- entry-remediation PR 的 test、lint、typecheck 与 production build 全部通过；PR 创建后停止，合并前不开始下一步。
+
 ### 1. 完成 production RoleRunner Adapter
 
 在 `InterviewAgents` 内部 seam 实现 OpenRouter/Agents SDK Adapter，并保持 Scripted Adapter 可运行同一组 interface tests。

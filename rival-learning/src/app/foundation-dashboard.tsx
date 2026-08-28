@@ -2,50 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
-interface ProfileInput {
-  name: string;
-  resume: string;
-  projectNotes: string;
-  jobDescription: string;
-  targetRole: string;
-  targetLevel: string;
-  repoPath: string | null;
-}
+import type {
+  PreparationProfile,
+  PreparationProfileInput,
+  ProviderView,
+} from "@/server/preparation-profiles";
+import type { SessionView, TimelineEvent } from "@/server/session-engine";
 
-interface Profile extends ProfileInput {
-  id: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface ProviderView {
-  id: string;
-  content: {
-    resume: string;
-    projectNotes: string;
-    jobDescription: string;
-    targetRole: string;
-    targetLevel: string;
-  };
-  confirmedAt: string | null;
-  redactionVersion: string;
-}
-
-interface Session {
-  id: string;
-  status: string;
-  sourceProfileId: string | null;
-  profileSnapshot: { profile: Profile; providerView: ProviderView["content"] };
-  state: { plan: { objective: string; evidenceAnchor: string } | null };
-}
-
-interface TimelineEvent {
-  sequence: number;
-  type: string;
-  payload: unknown;
-}
-
-const emptyInput: ProfileInput = {
+const emptyInput: PreparationProfileInput = {
   name: "",
   resume: "",
   projectNotes: "",
@@ -55,8 +19,20 @@ const emptyInput: ProfileInput = {
   repoPath: null,
 };
 
-async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
-  const response = await fetch(input, init);
+async function requestJson<T>(
+  input: RequestInfo,
+  init?: RequestInit,
+  networkRetries = 0,
+): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(input, init);
+  } catch (error) {
+    if (networkRetries > 0) {
+      return requestJson<T>(input, init, networkRetries - 1);
+    }
+    throw error;
+  }
   const body = (await response.json()) as T & { error?: { message?: string } };
   if (!response.ok) {
     throw new Error(body.error?.message ?? `Request failed with ${response.status}`);
@@ -65,30 +41,30 @@ async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T
 }
 
 export function FoundationDashboard() {
-  const [profiles, setProfiles] = useState<Profile[]>([]);
-  const [sessions, setSessions] = useState<Session[]>([]);
+  const [profiles, setProfiles] = useState<PreparationProfile[]>([]);
+  const [sessions, setSessions] = useState<SessionView[]>([]);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [providerView, setProviderView] = useState<ProviderView | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
-  const [form, setForm] = useState<ProfileInput>(emptyInput);
+  const [form, setForm] = useState<PreparationProfileInput>(emptyInput);
   const [message, setMessage] = useState("准备创建第一个 PreparationProfile。");
   const [busy, setBusy] = useState(true);
   const initialLoad = useRef<
-    Promise<[{ profiles: Profile[] }, { sessions: Session[] }]> | null
+    Promise<[{ profiles: PreparationProfile[] }, { sessions: SessionView[] }]> | null
   >(null);
 
   const loadProfiles = useCallback(async () => {
-    const data = await requestJson<{ profiles: Profile[] }>("/api/profiles");
+    const data = await requestJson<{ profiles: PreparationProfile[] }>("/api/profiles");
     setProfiles(data.profiles);
   }, []);
 
   const loadSessions = useCallback(async () => {
-    const data = await requestJson<{ sessions: Session[] }>("/api/sessions");
+    const data = await requestJson<{ sessions: SessionView[] }>("/api/sessions");
     setSessions(data.sessions);
   }, []);
 
-  const selectProfile = useCallback(async (profile: Profile) => {
+  const selectProfile = useCallback(async (profile: PreparationProfile) => {
     setSelectedProfileId(profile.id);
     setForm({
       name: profile.name,
@@ -111,7 +87,7 @@ export function FoundationDashboard() {
   }, []);
 
   const loadSessionDetail = useCallback(async (sessionId: string) => {
-    const data = await requestJson<{ session: Session; timeline: TimelineEvent[] }>(
+    const data = await requestJson<{ session: SessionView; timeline: TimelineEvent[] }>(
       `/api/sessions/${sessionId}`,
     );
     setSelectedSessionId(sessionId);
@@ -119,10 +95,37 @@ export function FoundationDashboard() {
   }, []);
 
   useEffect(() => {
+    if (!selectedSessionId) return;
+    const source = new EventSource(`/api/sessions/${selectedSessionId}/events`);
+    const receiveTimelineEvent = (message: Event) => {
+      if (!(message instanceof MessageEvent)) return;
+      try {
+        const nextEvent = JSON.parse(message.data) as TimelineEvent;
+        if (!Number.isSafeInteger(nextEvent.sequence) || typeof nextEvent.type !== "string") {
+          return;
+        }
+        setTimeline((current) => {
+          if (current.some((event) => event.sequence === nextEvent.sequence)) {
+            return current;
+          }
+          return [...current, nextEvent].sort((left, right) => left.sequence - right.sequence);
+        });
+      } catch {
+        // A malformed public event is ignored; reconnect or a detail refresh restores state.
+      }
+    };
+    source.addEventListener("timeline", receiveTimelineEvent);
+    return () => {
+      source.removeEventListener("timeline", receiveTimelineEvent);
+      source.close();
+    };
+  }, [selectedSessionId]);
+
+  useEffect(() => {
     let cancelled = false;
     initialLoad.current ??= Promise.all([
-      requestJson<{ profiles: Profile[] }>("/api/profiles"),
-      requestJson<{ sessions: Session[] }>("/api/sessions"),
+      requestJson<{ profiles: PreparationProfile[] }>("/api/profiles"),
+      requestJson<{ sessions: SessionView[] }>("/api/sessions"),
     ]);
     void initialLoad.current
       .then(([profileData, sessionData]) => {
@@ -143,7 +146,7 @@ export function FoundationDashboard() {
     };
   }, []);
 
-  function updateField(field: keyof ProfileInput, value: string) {
+  function updateField(field: keyof PreparationProfileInput, value: string) {
     setForm((current) => ({ ...current, [field]: value || (field === "repoPath" ? null : "") }));
   }
 
@@ -152,7 +155,7 @@ export function FoundationDashboard() {
     setBusy(true);
     try {
       if (selectedProfileId) {
-        const data = await requestJson<{ profile: Profile }>(
+        const data = await requestJson<{ profile: PreparationProfile }>(
           `/api/profiles/${selectedProfileId}`,
           {
             method: "PATCH",
@@ -164,7 +167,7 @@ export function FoundationDashboard() {
         await selectProfile(data.profile);
         setMessage("Profile 已更新；如资料变化，请重新确认 ProviderView。");
       } else {
-        const data = await requestJson<{ profile: Profile }>("/api/profiles", {
+        const data = await requestJson<{ profile: PreparationProfile }>("/api/profiles", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(form),
@@ -197,10 +200,10 @@ export function FoundationDashboard() {
     }
   }
 
-  async function duplicateProfile(profile: Profile) {
+  async function duplicateProfile(profile: PreparationProfile) {
     setBusy(true);
     try {
-      const data = await requestJson<{ profile: Profile }>(
+      const data = await requestJson<{ profile: PreparationProfile }>(
         `/api/profiles/${profile.id}/duplicate`,
         { method: "POST" },
       );
@@ -214,7 +217,7 @@ export function FoundationDashboard() {
     }
   }
 
-  async function deleteProfile(profile: Profile) {
+  async function deleteProfile(profile: PreparationProfile) {
     setBusy(true);
     try {
       const details = await requestJson<{
@@ -243,11 +246,20 @@ export function FoundationDashboard() {
     if (!selectedProfileId) return;
     setBusy(true);
     try {
-      const result = await requestJson<{ status: string; session: Session }>("/api/sessions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profileId: selectedProfileId }),
-      });
+      const sessionId = crypto.randomUUID();
+      const idempotencyKey = crypto.randomUUID();
+      const result = await requestJson<{ status: string; session: SessionView }>(
+        "/api/sessions",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotencyKey,
+          },
+          body: JSON.stringify({ sessionId, profileId: selectedProfileId }),
+        },
+        1,
+      );
       await loadSessions();
       await loadSessionDetail(result.session.id);
       setMessage("Session 已从不可变 ProfileSnapshot 创建。");
@@ -262,11 +274,19 @@ export function FoundationDashboard() {
     if (!selectedSessionId) return;
     setBusy(true);
     try {
-      await requestJson(`/api/sessions/${selectedSessionId}/actions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type }),
-      });
+      const idempotencyKey = crypto.randomUUID();
+      await requestJson(
+        `/api/sessions/${selectedSessionId}/actions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": idempotencyKey,
+          },
+          body: JSON.stringify({ type }),
+        },
+        1,
+      );
       await Promise.all([loadSessions(), loadSessionDetail(selectedSessionId)]);
       setMessage(type === "generate_plan" ? "Fake plan 已生成。" : "Foundation Session 已启动。");
     } catch (error) {

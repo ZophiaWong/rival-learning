@@ -102,7 +102,7 @@ describe("database migration interface", () => {
     database.close();
   });
 
-  it("rejects orphan rows and duplicate active operation tokens", () => {
+  it("preserves command results without a Session while rejecting orphan domain rows and duplicate operation tokens", () => {
     const directory = mkdtempSync(join(tmpdir(), "rival-learning-constraints-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "app.db");
@@ -121,6 +121,26 @@ describe("database migration interface", () => {
         )
         .run("view-orphan", "missing-profile", "hash", "contact-v1", "{}", timestamp),
     ).toThrow(/foreign key/i);
+
+    database
+      .prepare(
+        `insert into idempotency_results
+          (session_id, idempotency_key, command_type, command_fingerprint, result_json, created_at)
+         values (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "not-yet-created-session",
+        "create-1",
+        "create_session",
+        "synthetic-fingerprint",
+        '{"status":"rejected"}',
+        timestamp,
+      );
+    expect(
+      database
+        .prepare("select count(*) as count from idempotency_results where session_id = ?")
+        .get("not-yet-created-session"),
+    ).toEqual({ count: 1 });
 
     expect(() =>
       database

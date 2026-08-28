@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { InterviewAgents } from "@/server/interview-agents";
 import {
@@ -49,11 +49,29 @@ export type DispatchResult =
   | { status: "applied"; session: SessionView; events: TimelineEvent[] }
   | { status: "rejected"; error: SessionCommandError };
 
+function commandFingerprint(command: SessionCommand): string {
+  const payload =
+    command.type === "create_session"
+      ? { type: command.type, sessionId: command.sessionId, profileId: command.profileId }
+      : { type: command.type, sessionId: command.sessionId };
+  return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+}
+
+function idempotencyConflict(): DispatchResult {
+  return {
+    status: "rejected",
+    error: {
+      code: "idempotency_key_conflict",
+      message: "Idempotency-Key was already used for a different SessionCommand",
+    },
+  };
+}
+
 export interface SessionEngine {
   dispatch(command: SessionCommand): Promise<DispatchResult>;
   get(sessionId: string): SessionView;
   list(): SessionView[];
-  timeline(sessionId: string): TimelineEvent[];
+  timeline(sessionId: string, afterSequence?: number): TimelineEvent[];
   close(): void;
 }
 
@@ -143,14 +161,14 @@ class ApplicationSessionEngine implements SessionEngine {
     return rows.map(mapSession);
   }
 
-  timeline(sessionId: string): TimelineEvent[] {
+  timeline(sessionId: string, afterSequence = 0): TimelineEvent[] {
     this.get(sessionId);
     const rows = this.database
       .prepare(
         `select sequence, event_type, payload_json, created_at
-         from session_timeline where session_id = ? order by sequence`,
+         from session_timeline where session_id = ? and sequence > ? order by sequence`,
       )
-      .all(sessionId) as Array<{
+      .all(sessionId, afterSequence) as Array<{
       sequence: number;
       event_type: string;
       payload_json: string;
@@ -169,17 +187,17 @@ class ApplicationSessionEngine implements SessionEngine {
   }
 
   private createSession(command: Extract<SessionCommand, { type: "create_session" }>): DispatchResult {
-    const duplicate = this.findDuplicate(command.sessionId, command.idempotencyKey);
-    if (duplicate) {
-      return duplicate;
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) {
+      return idempotencyResult;
     }
 
     const existing = this.database.prepare("select 1 from sessions where id = ?").get(command.sessionId);
     if (existing) {
-      return {
+      return this.commitRejection(command, {
         status: "rejected",
         error: { code: "session_exists", message: `Session already exists: ${command.sessionId}` },
-      };
+      });
     }
 
     let snapshot: Readonly<ProfileSnapshot>;
@@ -187,7 +205,10 @@ class ApplicationSessionEngine implements SessionEngine {
       snapshot = this.preparationProfiles.createSnapshot(command.profileId);
     } catch (error) {
       if (error instanceof ProviderViewNotConfirmedError || error instanceof ProfileNotFoundError) {
-        return { status: "rejected", error: { code: error.code, message: error.message } };
+        return this.commitRejection(command, {
+          status: "rejected",
+          error: { code: error.code, message: error.message },
+        });
       }
       throw error;
     }
@@ -253,29 +274,38 @@ class ApplicationSessionEngine implements SessionEngine {
   private async generatePlan(
     command: Extract<SessionCommand, { type: "generate_plan" }>,
   ): Promise<DispatchResult> {
-    const duplicate = this.findDuplicate(command.sessionId, command.idempotencyKey);
-    if (duplicate) {
-      return duplicate;
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) {
+      return idempotencyResult;
     }
 
     let session: SessionView;
     try {
       session = this.get(command.sessionId);
     } catch {
-      return {
+      return this.commitRejection(command, {
         status: "rejected",
         error: { code: "session_not_found", message: `Session not found: ${command.sessionId}` },
-      };
+      });
     }
 
-    if (session.status !== "draft" || session.operationToken !== null) {
+    if (session.operationToken !== null) {
       return {
         status: "rejected",
         error: {
-          code: session.operationToken ? "session_busy" : "invalid_session_state",
+          code: "session_busy",
           message: `Cannot generate plan while Session is ${session.status}`,
         },
       };
+    }
+    if (session.status !== "draft") {
+      return this.commitRejection(command, {
+        status: "rejected",
+        error: {
+          code: "invalid_session_state",
+          message: `Cannot generate plan while Session is ${session.status}`,
+        },
+      });
     }
 
     const operationToken = this.createOperationToken();
@@ -398,25 +428,31 @@ class ApplicationSessionEngine implements SessionEngine {
   private startSession(
     command: Extract<SessionCommand, { type: "start" }>,
   ): DispatchResult {
-    const duplicate = this.findDuplicate(command.sessionId, command.idempotencyKey);
-    if (duplicate) {
-      return duplicate;
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) {
+      return idempotencyResult;
     }
 
     let session: SessionView;
     try {
       session = this.get(command.sessionId);
     } catch {
-      return {
+      return this.commitRejection(command, {
         status: "rejected",
         error: { code: "session_not_found", message: `Session not found: ${command.sessionId}` },
-      };
+      });
     }
-    if (session.status !== "planned" || session.operationToken !== null) {
+    if (session.operationToken !== null) {
       return {
         status: "rejected",
-        error: { code: "invalid_session_state", message: `Cannot start Session from ${session.status}` },
+        error: { code: "session_busy", message: `Cannot start Session from ${session.status}` },
       };
+    }
+    if (session.status !== "planned") {
+      return this.commitRejection(command, {
+        status: "rejected",
+        error: { code: "invalid_session_state", message: `Cannot start Session from ${session.status}` },
+      });
     }
 
     const timestamp = this.now();
@@ -455,13 +491,32 @@ class ApplicationSessionEngine implements SessionEngine {
     return result;
   }
 
-  private findDuplicate(sessionId: string, idempotencyKey: string): DispatchResult | null {
+  private findIdempotencyResult(command: SessionCommand): DispatchResult | null {
     const found = this.database
       .prepare(
-        "select result_json from idempotency_results where session_id = ? and idempotency_key = ?",
+        `select command_type, command_fingerprint, result_json
+         from idempotency_results where session_id = ? and idempotency_key = ?`,
       )
-      .get(sessionId, idempotencyKey) as { result_json: string } | undefined;
-    return found ? (JSON.parse(found.result_json) as DispatchResult) : null;
+      .get(command.sessionId, command.idempotencyKey) as
+      | { command_type: string; command_fingerprint: string; result_json: string }
+      | undefined;
+    if (!found) {
+      return null;
+    }
+    const fingerprintMatches = found.command_fingerprint
+      ? found.command_fingerprint === commandFingerprint(command)
+      : found.command_type === command.type;
+    return fingerprintMatches
+      ? (JSON.parse(found.result_json) as DispatchResult)
+      : idempotencyConflict();
+  }
+
+  private commitRejection(
+    command: SessionCommand,
+    result: Extract<DispatchResult, { status: "rejected" }>,
+  ): DispatchResult {
+    this.insertIdempotency(command, this.now(), result);
+    return result;
   }
 
   private nextSequence(sessionId: string): number {
@@ -495,13 +550,14 @@ class ApplicationSessionEngine implements SessionEngine {
     this.database
       .prepare(
         `insert into idempotency_results
-          (session_id, idempotency_key, command_type, result_json, created_at)
-         values (?, ?, ?, ?, ?)`,
+          (session_id, idempotency_key, command_type, command_fingerprint, result_json, created_at)
+         values (?, ?, ?, ?, ?, ?)`,
       )
       .run(
         command.sessionId,
         command.idempotencyKey,
         command.type,
+        commandFingerprint(command),
         JSON.stringify(result),
         timestamp.getTime(),
       );

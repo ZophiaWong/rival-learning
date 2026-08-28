@@ -79,11 +79,10 @@ export const sessionTimeline = sqliteTable(
 export const idempotencyResults = sqliteTable(
   "idempotency_results",
   {
-    sessionId: text("session_id")
-      .notNull()
-      .references(() => sessions.id, { onDelete: "cascade" }),
+    sessionId: text("session_id").notNull(),
     idempotencyKey: text("idempotency_key").notNull(),
     commandType: text("command_type").notNull(),
+    commandFingerprint: text("command_fingerprint").notNull().default(""),
     resultJson: text("result_json").notNull(),
     createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
   },

@@ -1,6 +1,6 @@
 # Implementation Status
 
 Documentation: complete
-Implementation: 01-foundation complete
-Active milestone: none
-Next action: review 01-foundation and explicitly discuss activation of 02-core-loop with the user
+Implementation: 01-foundation complete; 02-core-loop entry remediation complete
+Active milestone: 02-core-loop
+Next action: review and merge the entry-remediation PR before provider integration

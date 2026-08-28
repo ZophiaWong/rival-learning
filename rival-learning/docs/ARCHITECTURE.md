@@ -52,7 +52,6 @@ Routes 只验证 transport 输入、鉴权本地请求、调用 Module interface
 ```ts
 type DispatchResult =
   | { status: "applied"; session: SessionView; events: TimelineEvent[] }
-  | { status: "duplicate"; session: SessionView }
   | { status: "rejected"; error: SessionCommandError };
 
 interface SessionEngine {
@@ -140,7 +139,7 @@ Agents SDK 只执行一个角色的一次领域操作，包括结构化输出、
 3. 在新的短 transaction 中按 operation token 比对预期状态；只提交一次 domain result、usage、timeline events 和新 current state。
 4. 进程中断后，将未完成 operation 标记为可恢复错误；`resume_error` 依据已保存事实决定安全重试或继续提交。
 
-相同 idempotency key 重复提交返回第一次已提交结果，不重复推进流程或扣减已记录 usage。并发 action 只能有一个获得相应 session operation token。
+相同 idempotency key 与相同 command payload 重复提交时返回第一次终态结果，不重复推进流程或扣减已记录 usage；重放不会改变原结果的 `status`。相同 key 携带不同 command type 或 payload 时返回 `idempotency_key_conflict`。确定性拒绝属于终态并保存；`session_busy` 等尚未形成终态的并发结果不消耗 key。并发 action 只能有一个获得相应 session operation token。
 
 ## Provider 与预算
 
@@ -221,3 +220,5 @@ GET    /api/config/providers
 ```
 
 `POST /actions` 只接收 `SessionCommand` 的 transport representation；所有状态转换仍由 `SessionEngine.dispatch` 决定。`GET /events` 使用 SSE 发布可公开的 timeline/state 更新，支持断线后按 event id 续读；它不发送 prompt、hidden reasoning、API key 或未披露的 `Judge` 数据。
+
+所有 `/api` 请求只接受 loopback Host；`POST`、`PATCH` 与 `DELETE` 还要求 `Origin` 与当前 request origin 相同。Session 写请求必须携带经过 runtime validation 的 `Idempotency-Key`。创建 `Session` 时，客户端先生成 UUID identity，再提交 `{ sessionId, profileId }`；同一次网络重试复用完整 command 与 key。

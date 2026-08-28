@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   getProviderConfigurationStatus,
   parseServerConfig,
   ServerConfigError,
 } from "@/server/config/server-config";
+import { errorResponse } from "@/server/http";
 
 describe("server configuration interface", () => {
   it("rejects missing required local runtime configuration without exposing environment values", () => {
@@ -48,5 +49,26 @@ describe("server configuration interface", () => {
       judge: { configured: false, provider: null, model: null },
     });
     expect(JSON.stringify(status)).not.toContain(secret);
+  });
+
+  it("does not serialize or log a canary secret from an unexpected error", async () => {
+    const secret = "sk-test-unexpected-error-must-not-leak";
+    const error = new Error(`Provider failed with ${secret}`);
+    error.name = `ProviderError-${secret}`;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      const response = errorResponse(error);
+      const serializedResponse = JSON.stringify({
+        body: await response.text(),
+        headers: [...response.headers.entries()],
+      });
+      const serializedLogs = JSON.stringify(consoleError.mock.calls);
+
+      expect(serializedResponse).not.toContain(secret);
+      expect(serializedLogs).not.toContain(secret);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });
