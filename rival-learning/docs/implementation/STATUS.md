@@ -1,6 +1,6 @@
 # Implementation Status
 
 Documentation: complete
-Implementation: not started
+Implementation: 01-foundation complete
 Active milestone: none
-Next action: discuss and explicitly activate 01-foundation with the user
+Next action: review 01-foundation and explicitly discuss activation of 02-core-loop with the user
