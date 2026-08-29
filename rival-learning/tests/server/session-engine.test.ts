@@ -68,17 +68,25 @@ describe("SessionEngine.dispatch interface", () => {
 
     profiles.previewProviderView(profile.id);
     profiles.confirmProviderView(profile.id);
-    const created = await engine.dispatch({
+    const replayedRejection = await engine.dispatch({
       type: "create_session",
       sessionId: "session-1",
       profileId: profile.id,
       idempotencyKey: "create-1",
     });
+    expect(replayedRejection).toEqual(rejected);
+
+    const created = await engine.dispatch({
+      type: "create_session",
+      sessionId: "session-1",
+      profileId: profile.id,
+      idempotencyKey: "create-2",
+    });
     const duplicate = await engine.dispatch({
       type: "create_session",
       sessionId: "session-1",
       profileId: profile.id,
-      idempotencyKey: "create-1",
+      idempotencyKey: "create-2",
     });
 
     expect(created).toMatchObject({
@@ -95,6 +103,10 @@ describe("SessionEngine.dispatch interface", () => {
       events: [{ sequence: 1, type: "session_created" }],
     });
     expect(duplicate).toEqual(created);
+    expect(engine.list()).toHaveLength(1);
+    expect(engine.timeline("session-1").map((event) => event.type)).toEqual([
+      "session_created",
+    ]);
 
     profiles.update(profile.id, {
       ...profiles.get(profile.id),
@@ -225,6 +237,71 @@ describe("SessionEngine.dispatch interface", () => {
     expect(engine.timeline("session-1").map((event) => event.type)).toEqual([
       "session_created",
     ]);
+
+    engine.close();
+    engine = createSessionEngine({
+      databasePath,
+      preparationProfiles: profiles,
+      interviewAgents: new ScriptedInterviewAgents([
+        {
+          status: "success",
+          value: { objective: "Probe ownership", evidenceAnchor: "queue consumer" },
+          usage: { requests: 1, inputTokens: 10, outputTokens: 5 },
+        },
+      ]),
+    });
+    await engine.dispatch({
+      type: "generate_plan",
+      sessionId: "session-1",
+      idempotencyKey: "plan-1",
+    });
+
+    const replayed = await engine.dispatch({
+      type: "start",
+      sessionId: "session-1",
+      idempotencyKey: "start-too-early",
+    });
+
+    expect(replayed).toEqual(result);
+    expect(engine.get("session-1").status).toBe("planned");
+
+    const started = await engine.dispatch({
+      type: "start",
+      sessionId: "session-1",
+      idempotencyKey: "start-after-plan",
+    });
+    expect(started).toMatchObject({ status: "applied", session: { status: "active" } });
+  });
+
+  it("rejects reuse of an idempotency key for a different command or payload", async () => {
+    const first = await engine.dispatch({
+      type: "create_session",
+      sessionId: "session-1",
+      profileId: "missing-profile-1",
+      idempotencyKey: "shared-key",
+    });
+    expect(first).toMatchObject({ status: "rejected", error: { code: "profile_not_found" } });
+
+    const changedPayload = await engine.dispatch({
+      type: "create_session",
+      sessionId: "session-1",
+      profileId: "missing-profile-2",
+      idempotencyKey: "shared-key",
+    });
+    const changedCommand = await engine.dispatch({
+      type: "start",
+      sessionId: "session-1",
+      idempotencyKey: "shared-key",
+    });
+
+    expect(changedPayload).toEqual({
+      status: "rejected",
+      error: {
+        code: "idempotency_key_conflict",
+        message: "Idempotency-Key was already used for a different SessionCommand",
+      },
+    });
+    expect(changedCommand).toEqual(changedPayload);
   });
 
   it("restores Profile and Session state after reopening database-backed modules", async () => {
@@ -365,6 +442,16 @@ describe("SessionEngine.dispatch interface", () => {
     expect(concurrent).toMatchObject({ status: "rejected", error: { code: "session_busy" } });
     expect(applied).toMatchObject({ status: "applied", session: { status: "planned" } });
     expect(duplicate).toEqual(applied);
+
+    const retriedConcurrentAttempt = await engine.dispatch({
+      type: "generate_plan",
+      sessionId: "session-1",
+      idempotencyKey: "plan-2",
+    });
+    expect(retriedConcurrentAttempt).toMatchObject({
+      status: "rejected",
+      error: { code: "invalid_session_state" },
+    });
     expect(engine.timeline("session-1").map((event) => event.type)).toEqual([
       "session_created",
       "plan_generated",

@@ -5,6 +5,23 @@ test.setTimeout(60_000);
 test("Profile confirmation, Session snapshot, reuse, duplicate, and retained history", async ({
   page,
 }) => {
+  let sessionCreateRequest:
+    | { body: { profileId?: string; sessionId?: string }; idempotencyKey?: string }
+    | undefined;
+  let eventStreamRequests = 0;
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (request.method() === "POST" && url.pathname === "/api/sessions") {
+      sessionCreateRequest = {
+        body: request.postDataJSON() as { profileId?: string; sessionId?: string },
+        idempotencyKey: request.headers()["idempotency-key"],
+      };
+    }
+    if (request.method() === "GET" && /\/api\/sessions\/[^/]+\/events$/.test(url.pathname)) {
+      eventStreamRequests += 1;
+    }
+  });
+
   await page.goto("/");
 
   await page.getByLabel("名称").fill("Backend preparation");
@@ -34,12 +51,26 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
   await page.getByRole("button", { name: "创建 Session" }).click();
 
   await expect(page.getByRole("status")).toContainText("不可变 ProfileSnapshot");
+  expect(sessionCreateRequest?.body.sessionId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
+  expect(sessionCreateRequest?.idempotencyKey).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+  await expect.poll(() => eventStreamRequests).toBeGreaterThan(0);
   await expect(page.getByLabel("Session timeline")).toContainText("session_created");
   await page.getByRole("button", { name: "生成 Fake Plan" }).click();
   await expect(page.getByLabel("Session timeline")).toContainText("plan_generated");
   await page.getByRole("button", { name: "启动 Session" }).click();
   await expect(page.getByRole("status")).toContainText("Foundation Session 已启动");
   await expect(page.getByLabel("Session timeline")).toContainText("session_started");
+  await expect(
+    page.getByLabel("Session timeline").locator("li").filter({ hasText: "session_created" }),
+  ).toHaveCount(1);
+  await expect(
+    page.getByLabel("Session timeline").locator("li").filter({ hasText: "plan_generated" }),
+  ).toHaveCount(1);
+  await expect(
+    page.getByLabel("Session timeline").locator("li").filter({ hasText: "session_started" }),
+  ).toHaveCount(1);
 
   await page
     .getByLabel("Resume")

@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 
-const profileInputSchema = z
+export const preparationProfileInputSchema = z
   .object({
     name: z.string().trim().min(1),
     resume: z.string(),
@@ -22,15 +22,7 @@ const profileInputSchema = z
     }
   });
 
-export interface PreparationProfileInput {
-  name: string;
-  resume: string;
-  projectNotes: string;
-  jobDescription: string;
-  targetRole: string;
-  targetLevel: string;
-  repoPath: string | null;
-}
+export type PreparationProfileInput = z.infer<typeof preparationProfileInputSchema>;
 
 export interface PreparationProfile extends PreparationProfileInput {
   id: string;
@@ -224,6 +216,17 @@ function contentHash(input: PreparationProfileInput): string {
     .digest("hex");
 }
 
+function parsePreparationProfileInput(input: PreparationProfileInput): PreparationProfileInput {
+  const result = preparationProfileInputSchema.safeParse(input);
+  if (!result.success) {
+    const fields = [...new Set(result.error.issues.map((issue) => String(issue.path[0])))]
+      .filter(Boolean)
+      .sort();
+    throw new ProfileValidationError(fields);
+  }
+  return result.data;
+}
+
 class SqlitePreparationProfiles implements PreparationProfiles {
   private readonly database: Database.Database;
   private readonly createId: () => string;
@@ -237,19 +240,13 @@ class SqlitePreparationProfiles implements PreparationProfiles {
   }
 
   create(input: PreparationProfileInput): PreparationProfile {
-    const result = profileInputSchema.safeParse(input);
-    if (!result.success) {
-      const fields = [...new Set(result.error.issues.map((issue) => String(issue.path[0])))]
-        .filter(Boolean)
-        .sort();
-      throw new ProfileValidationError(fields);
-    }
+    const parsedInput = parsePreparationProfileInput(input);
 
     const id = this.createId();
     const timestamp = this.now();
     const profile: PreparationProfile = {
       id,
-      ...result.data,
+      ...parsedInput,
       createdAt: timestamp.toISOString(),
       updatedAt: timestamp.toISOString(),
     };
@@ -279,18 +276,12 @@ class SqlitePreparationProfiles implements PreparationProfiles {
 
   update(id: string, input: PreparationProfileInput): PreparationProfile {
     this.get(id);
-    const result = profileInputSchema.safeParse(input);
-    if (!result.success) {
-      const fields = [...new Set(result.error.issues.map((issue) => String(issue.path[0])))]
-        .filter(Boolean)
-        .sort();
-      throw new ProfileValidationError(fields);
-    }
+    const parsedInput = parsePreparationProfileInput(input);
 
     const previous = this.database
       .prepare("select content_hash from preparation_profiles where id = ?")
       .get(id) as { content_hash: string };
-    const nextContentHash = contentHash(result.data);
+    const nextContentHash = contentHash(parsedInput);
     const updatedAt = this.now();
 
     this.database.transaction(() => {
@@ -308,13 +299,13 @@ class SqlitePreparationProfiles implements PreparationProfiles {
            where id = ?`,
         )
         .run(
-          result.data.name,
-          result.data.resume,
-          result.data.projectNotes,
-          result.data.jobDescription,
-          result.data.targetRole,
-          result.data.targetLevel,
-          result.data.repoPath,
+          parsedInput.name,
+          parsedInput.resume,
+          parsedInput.projectNotes,
+          parsedInput.jobDescription,
+          parsedInput.targetRole,
+          parsedInput.targetLevel,
+          parsedInput.repoPath,
           nextContentHash,
           updatedAt.getTime(),
           id,
