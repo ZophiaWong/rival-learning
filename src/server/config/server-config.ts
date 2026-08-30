@@ -1,8 +1,10 @@
 import { z } from "zod";
 
 const roleNames = ["interviewer", "candidate", "judge"] as const;
+const supportedProviderIds = ["openrouter"] as const;
 
-type RoleName = (typeof roleNames)[number];
+export type RoleName = (typeof roleNames)[number];
+export type ProviderId = (typeof supportedProviderIds)[number];
 
 const environmentSchema = z.object({
   RIVAL_DATABASE_PATH: z.string().trim().min(1),
@@ -31,9 +33,10 @@ export interface ServerConfig {
 }
 
 export interface ProviderConfigurationStatus {
-  configured: boolean;
+  status: "configured" | "missing" | "unsupported";
   provider: string | null;
   model: string | null;
+  missingFields: Array<"provider" | "model" | "apiKey">;
 }
 
 export class ServerConfigError extends Error {
@@ -86,14 +89,26 @@ export function getProviderConfigurationStatus(
   return Object.fromEntries(
     roleNames.map((role) => {
       const providerConfig = config.providers[role];
+      const missingFields: ProviderConfigurationStatus["missingFields"] = [];
+      if (!providerConfig.provider) missingFields.push("provider");
+      if (!providerConfig.model) missingFields.push("model");
+      if (!providerConfig.apiKey) missingFields.push("apiKey");
+
+      const status =
+        providerConfig.provider &&
+        !supportedProviderIds.includes(providerConfig.provider as ProviderId)
+          ? "unsupported"
+          : missingFields.length > 0
+            ? "missing"
+            : "configured";
+
       return [
         role,
         {
-          configured: Boolean(
-            providerConfig.provider && providerConfig.model && providerConfig.apiKey,
-          ),
+          status,
           provider: providerConfig.provider ?? null,
           model: providerConfig.model ?? null,
+          missingFields,
         },
       ];
     }),
