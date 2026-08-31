@@ -39,6 +39,22 @@ function runAnswer(runner: RoleRunner, signal?: AbortSignal) {
   });
 }
 
+function runStreamedAnswer(
+  runner: RoleRunner,
+  onOutputDelta: (delta: string) => void | Promise<void>,
+  signal?: AbortSignal,
+) {
+  return runner.runStructured({
+    role: "interviewer",
+    operation: "stream_contract_test",
+    instructions: "Synthetic instructions",
+    input: "Synthetic input",
+    outputSchema: answerSchema,
+    signal,
+    onOutputDelta,
+  });
+}
+
 function scripted(step: ScriptedRoleRunStep): RoleRunner {
   return new ScriptedRoleRunner([step]);
 }
@@ -47,6 +63,8 @@ interface RoleRunnerContractHarness {
   success(): RoleRunner;
   failure(): RoleRunner;
   schemaInvalid(): RoleRunner;
+  streamSuccess(): RoleRunner;
+  streamFailureAfterDelta(): RoleRunner;
 }
 
 function scriptedHarness(): RoleRunnerContractHarness {
@@ -86,6 +104,20 @@ function scriptedHarness(): RoleRunnerContractHarness {
         value: { answer: 42 },
         attempts: [successfulAttempt],
       }),
+    streamSuccess: () =>
+      scripted({
+        status: "success",
+        value: { answer: "bounded response" },
+        deltas: ['{"answer":"bounded response"}'],
+        attempts: [successfulAttempt],
+      }),
+    streamFailureAfterDelta: () =>
+      scripted({
+        status: "success",
+        value: { answer: 42 },
+        deltas: ['{"answer":42}'],
+        attempts: [{ ...successfulAttempt, outcome: "schema_invalid" }],
+      }),
   };
 }
 
@@ -120,6 +152,31 @@ function productionResponse(content: unknown) {
   };
 }
 
+function productionStreamResponse(content: string) {
+  const chunks = [
+    {
+      id: "chatcmpl-contract-stream",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test/model",
+      choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    },
+    {
+      id: "chatcmpl-contract-stream",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test/model",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      usage: { prompt_tokens: 4, completion_tokens: 2, total_tokens: 6 },
+    },
+  ];
+  const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "text/event-stream", "x-request-id": "request-1" },
+  });
+}
+
 function productionHarness(): RoleRunnerContractHarness {
   return {
     success: () =>
@@ -143,6 +200,12 @@ function productionHarness(): RoleRunnerContractHarness {
           headers: { "content-type": "application/json" },
         }),
       ),
+    streamSuccess: () =>
+      productionRunner(async () =>
+        productionStreamResponse('{"answer":"bounded response"}'),
+      ),
+    streamFailureAfterDelta: () =>
+      productionRunner(async () => productionStreamResponse('{"answer":42}')),
   };
 }
 
@@ -215,6 +278,53 @@ function defineRoleRunnerContract(
       },
     });
   });
+
+  it("does not replay a schema failure after delivering a streamed delta", async () => {
+    const onOutputDelta = vi.fn(async () => undefined);
+
+    const result = await runStreamedAnswer(
+      createHarness().streamFailureAfterDelta(),
+      onOutputDelta,
+    );
+
+    expect(onOutputDelta).toHaveBeenCalled();
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "stream_interrupted" },
+      attempts: [{ outcome: "stream_interrupted" }],
+      usage: { requests: 1 },
+    });
+  });
+
+  it("stops without replay when aborted after delivering a streamed delta", async () => {
+    const controller = new AbortController();
+
+    const result = await runStreamedAnswer(
+      createHarness().streamSuccess(),
+      () => controller.abort(),
+      controller.signal,
+    );
+
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "aborted" },
+      attempts: [{ outcome: "aborted" }],
+      usage: { requests: 1 },
+    });
+  });
+
+  it("stops without replay when the output callback fails", async () => {
+    const result = await runStreamedAnswer(createHarness().streamSuccess(), () => {
+      throw new Error("private callback failure");
+    });
+
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "stream_interrupted" },
+      attempts: [{ outcome: "stream_interrupted" }],
+      usage: { requests: 1 },
+    });
+  });
   });
 }
 
@@ -242,6 +352,27 @@ describe("ScriptedRoleRunner scripting", () => {
 
     expect(onOutputDelta.mock.calls).toEqual([["hel"], ["lo"]]);
     expect(result.status).toBe("success");
+  });
+
+  it("normalizes a scripted transport failure after delivering a delta", async () => {
+    const runner = scripted({
+      status: "failure",
+      error: {
+        code: "provider_unavailable",
+        message: "The provider is temporarily unavailable.",
+      },
+      deltas: ["partial"],
+      attempts: [{ ...successfulAttempt, outcome: "network_error" }],
+    });
+
+    const result = await runStreamedAnswer(runner, async () => undefined);
+
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "stream_interrupted" },
+      attempts: [{ outcome: "stream_interrupted" }],
+      usage: { requests: 1 },
+    });
   });
 
   it("can script an in-flight request that ends on abort", async () => {

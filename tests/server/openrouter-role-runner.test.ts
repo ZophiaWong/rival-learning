@@ -1,6 +1,12 @@
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 
+import {
+  getGlobalTraceProvider,
+  setDefaultOpenAITracingExporter,
+  setTraceProcessors,
+  type TracingProcessor,
+} from "@openai/agents";
 import OpenAI from "openai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -234,6 +240,97 @@ describe("OpenRouterRoleRunner", () => {
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
+  it("only sends the expected Chat Completions request and emits no tracing work", async () => {
+    const mock = await startMockServer([{ body: completion({ answer: "hello" }) }]);
+    const traceEvents: string[] = [];
+    const traceProcessor: TracingProcessor = {
+      async onTraceStart() {
+        traceEvents.push("trace_start");
+      },
+      async onTraceEnd() {
+        traceEvents.push("trace_end");
+      },
+      async onSpanStart() {
+        traceEvents.push("span_start");
+      },
+      async onSpanEnd() {
+        traceEvents.push("span_end");
+      },
+      async shutdown() {},
+      async forceFlush() {},
+    };
+    setTraceProcessors([traceProcessor]);
+
+    const originalFetch = globalThis.fetch;
+    const outboundUrls: string[] = [];
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      outboundUrls.push(
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url,
+      );
+      return originalFetch(input, init);
+    });
+
+    try {
+      const runner = new OpenRouterRoleRunner(
+        configuredEnvironment("sk-test-no-tracing"),
+        {
+          createClient: (options) =>
+            new OpenAI({ ...options, baseURL: mock.baseURL, fetch: globalThis.fetch }),
+        },
+      );
+
+      const result = await runner.runStructured({
+        role: "interviewer",
+        operation: "no_tracing_test",
+        instructions: "Synthetic instructions",
+        input: "Synthetic input",
+        outputSchema: z.object({ answer: z.string() }),
+      });
+      await getGlobalTraceProvider().forceFlush();
+
+      expect(result.status).toBe("success");
+      expect(traceEvents).toEqual([]);
+      expect(outboundUrls).toEqual([`${mock.baseURL}/chat/completions`]);
+    } finally {
+      fetchSpy.mockRestore();
+      setDefaultOpenAITracingExporter();
+    }
+  });
+
+  it("returns an SDK-transformed structured value without parsing it twice", async () => {
+    const mock = await startMockServer([{ body: completion({ score: "85" }) }]);
+    const runner = new OpenRouterRoleRunner(
+      configuredEnvironment("sk-test-single-parse"),
+      {
+        createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
+      },
+    );
+
+    const result = await runner.runStructured({
+      role: "interviewer",
+      operation: "single_parse_test",
+      instructions: "Synthetic instructions",
+      input: "Synthetic input",
+      outputSchema: z.object({
+        score: z.codec(z.string(), z.number(), {
+          decode: Number,
+          encode: String,
+        }),
+      }),
+    });
+
+    expect(result).toMatchObject({
+      status: "success",
+      value: { score: 85 },
+      usage: { requests: 1 },
+    });
+    expect(mock.requests).toHaveLength(1);
+  });
+
   it("returns safe typed configuration failures without making a request", async () => {
     const missing = new OpenRouterRoleRunner(
       parseServerConfig({
@@ -338,6 +435,41 @@ describe("OpenRouterRoleRunner", () => {
     expect(mock.requests).toHaveLength(3);
   });
 
+  it("succeeds after exactly two retryable failures", async () => {
+    const mock = await startMockServer([
+      { status: 500, body: { error: { message: "first transient failure" } } },
+      { status: 429, body: { error: { message: "second transient failure" } } },
+      { body: completion({ answer: "recovered on third request" }) },
+    ]);
+    const sleep = vi.fn(async (milliseconds: number) => {
+      void milliseconds;
+    });
+    const runner = new OpenRouterRoleRunner(
+      configuredEnvironment("sk-test-two-retries"),
+      {
+        createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
+        sleep,
+      },
+    );
+
+    const result = await runner.runStructured({
+      role: "interviewer",
+      operation: "two_retries_test",
+      instructions: "Synthetic instructions",
+      input: "Synthetic input",
+      outputSchema: z.object({ answer: z.string() }),
+    });
+
+    expect(result).toMatchObject({ status: "success", usage: { requests: 3 } });
+    expect(result.attempts.map((attempt) => attempt.outcome)).toEqual([
+      "http_error",
+      "http_error",
+      "succeeded",
+    ]);
+    expect(sleep.mock.calls.map(([delay]) => delay)).toEqual([500, 1000]);
+    expect(mock.requests).toHaveLength(3);
+  });
+
   it.each([
     [401, "provider_auth_failed"],
     [402, "provider_quota_exhausted"],
@@ -348,7 +480,9 @@ describe("OpenRouterRoleRunner", () => {
     const mock = await startMockServer([
       { status, body: { error: { message: "must remain private" } } },
     ]);
-    const sleep = vi.fn(async () => undefined);
+    const sleep = vi.fn(async (milliseconds: number) => {
+      void milliseconds;
+    });
     const runner = new OpenRouterRoleRunner(configuredEnvironment("sk-test-no-retry"), {
       createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
       sleep,
@@ -479,6 +613,97 @@ describe("OpenRouterRoleRunner", () => {
     expect(secondRequest).not.toContain(invalidRawCanary);
   });
 
+  it("stops after three schema-invalid attempts", async () => {
+    const mock = await startMockServer([
+      { body: completion({ answer: 41 }) },
+      { body: completion({ answer: 42 }) },
+      { body: completion({ answer: 43 }) },
+    ]);
+    const sleep = vi.fn(async (milliseconds: number) => {
+      void milliseconds;
+    });
+    const runner = new OpenRouterRoleRunner(
+      configuredEnvironment("sk-test-schema-exhaustion"),
+      {
+        createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
+        sleep,
+      },
+    );
+
+    const result = await runner.runStructured({
+      role: "interviewer",
+      operation: "schema_exhaustion_test",
+      instructions: "Synthetic instructions",
+      input: "Synthetic input",
+      outputSchema: z.object({ answer: z.string() }),
+    });
+
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "schema_invalid" },
+      usage: { requests: 3 },
+    });
+    expect(result.attempts.map((attempt) => attempt.outcome)).toEqual([
+      "schema_invalid",
+      "schema_invalid",
+      "schema_invalid",
+    ]);
+    expect(sleep.mock.calls.map(([delay]) => delay)).toEqual([500, 1000]);
+    expect(mock.requests).toHaveLength(3);
+  });
+
+  it("does not retry a non-schema model behavior error", async () => {
+    const mock = await startMockServer([
+      {
+        body: {
+          ...completion({ answer: "unused" }),
+          choices: [
+            {
+              index: 0,
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  {
+                    id: "call-unknown",
+                    type: "function",
+                    function: { name: "unknown_tool", arguments: "{}" },
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        },
+      },
+    ]);
+    const sleep = vi.fn(async () => undefined);
+    const runner = new OpenRouterRoleRunner(
+      configuredEnvironment("sk-test-model-behavior"),
+      {
+        createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
+        sleep,
+      },
+    );
+
+    const result = await runner.runStructured({
+      role: "interviewer",
+      operation: "model_behavior_test",
+      instructions: "Synthetic instructions",
+      input: "Synthetic input",
+      outputSchema: z.object({ answer: z.string() }),
+    });
+
+    expect(result).toMatchObject({
+      status: "failure",
+      error: { code: "internal_error" },
+      attempts: [{ outcome: "internal_error" }],
+      usage: { requests: 1 },
+    });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(mock.requests).toHaveLength(1);
+  });
+
   it("retries a streaming failure before any delta is delivered", async () => {
     const mock = await startMockServer([
       { status: 500, body: { error: { message: "transient" } } },
@@ -540,6 +765,52 @@ describe("OpenRouterRoleRunner", () => {
       usage: { requests: 1 },
     });
     expect(onOutputDelta).toHaveBeenCalledTimes(1);
+    expect(mock.requests).toHaveLength(1);
+  });
+
+  it("does not re-parse a transformed final output after streaming it", async () => {
+    const payload = JSON.stringify({ score: "85" });
+    const mock = await startMockServer([
+      {
+        streamChunks: [
+          streamChunk({ content: payload }),
+          streamChunk({
+            finishReason: "stop",
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          }),
+        ],
+      },
+    ]);
+    const onOutputDelta = vi.fn(async () => undefined);
+    const runner = new OpenRouterRoleRunner(
+      configuredEnvironment("sk-test-stream-single-parse"),
+      {
+        createClient: (options) => new OpenAI({ ...options, baseURL: mock.baseURL }),
+        sleep: async () => undefined,
+      },
+    );
+
+    const result = await runner.runStructured({
+      role: "interviewer",
+      operation: "stream_single_parse_test",
+      instructions: "Synthetic instructions",
+      input: "Synthetic input",
+      outputSchema: z.object({
+        score: z.codec(z.string(), z.number(), {
+          decode: Number,
+          encode: String,
+        }),
+      }),
+      onOutputDelta,
+    });
+
+    expect(onOutputDelta).toHaveBeenCalled();
+    expect(result).toMatchObject({
+      status: "success",
+      value: { score: 85 },
+      attempts: [{ outcome: "succeeded" }],
+      usage: { requests: 1 },
+    });
     expect(mock.requests).toHaveLength(1);
   });
 

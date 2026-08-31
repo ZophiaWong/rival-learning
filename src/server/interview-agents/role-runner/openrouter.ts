@@ -114,7 +114,11 @@ function parseRetryAfter(headers: Headers | undefined): number | null {
   return Number.isNaN(date) ? null : Math.max(0, date - Date.now());
 }
 
-function classifyError(error: unknown, signal?: AbortSignal): ClassifiedError {
+function classifyError(
+  error: unknown,
+  signal?: AbortSignal,
+  schemaFailureConfirmed = false,
+): ClassifiedError {
   if (error instanceof OutputCallbackError) {
     return {
       code: "stream_interrupted",
@@ -241,7 +245,7 @@ function classifyError(error: unknown, signal?: AbortSignal): ClassifiedError {
       retryAfterMs: null,
     };
   }
-  if (error instanceof ModelBehaviorError) {
+  if (error instanceof ModelBehaviorError && schemaFailureConfirmed) {
     return {
       code: "schema_invalid",
       message: "The model response did not match the required schema.",
@@ -249,6 +253,17 @@ function classifyError(error: unknown, signal?: AbortSignal): ClassifiedError {
       httpStatus: 200,
       requestId: error.state?._modelResponses.at(-1)?.requestId ?? null,
       retryable: true,
+      retryAfterMs: null,
+    };
+  }
+  if (error instanceof ModelBehaviorError) {
+    return {
+      code: "internal_error",
+      message: "The model request failed.",
+      outcome: "internal_error",
+      httpStatus: null,
+      requestId: error.state?._modelResponses.at(-1)?.requestId ?? null,
+      retryable: false,
       retryAfterMs: null,
     };
   }
@@ -441,7 +456,7 @@ export class OpenRouterRoleRunner implements RoleRunner {
             invalidOutputResponse = runData.rawResponses.at(-1);
           },
         };
-        let finalOutput: unknown;
+        let finalOutput: T | undefined;
         if (request.onOutputDelta) {
           const stream = await configuredBinding.runner.run(agent, request.input, {
             maxTurns: 1,
@@ -478,13 +493,12 @@ export class OpenRouterRoleRunner implements RoleRunner {
           streamedResponse = result.rawResponses.at(-1);
         }
 
-        const parsed = request.outputSchema.safeParse(finalOutput);
-        if (!parsed.success) {
+        if (finalOutput === undefined) {
           const attempt: ModelAttempt = {
             attempt: attemptNumber,
             providerId: "openrouter",
             model: configuredBinding.model,
-            outcome: "schema_invalid",
+            outcome: "internal_error",
             httpStatus: 200,
             requestId: streamedResponse?.requestId ?? null,
             durationMs: Math.max(0, this.now() - startedAt),
@@ -500,25 +514,11 @@ export class OpenRouterRoleRunner implements RoleRunner {
             ),
           };
           attempts.push(attempt);
-          if (attemptNumber < 3) {
-            schemaCorrection = formatZodIssues(parsed.error);
-            try {
-              await this.sleep(attemptNumber === 1 ? 500 : 1000, request.signal);
-            } catch {
-              return {
-                status: "failure",
-                error: { code: "aborted", message: "The model request was aborted." },
-                attempts,
-                usage: aggregateRoleRunUsage(attempts),
-              };
-            }
-            continue;
-          }
           return {
             status: "failure",
             error: {
-              code: "schema_invalid",
-              message: "The model response did not match the required schema.",
+              code: "internal_error",
+              message: "The model request failed.",
             },
             attempts,
             usage: aggregateRoleRunUsage(attempts),
@@ -544,12 +544,16 @@ export class OpenRouterRoleRunner implements RoleRunner {
         attempts.push(attempt);
         return {
           status: "success",
-          value: parsed.data,
+          value: finalOutput,
           attempts,
           usage: aggregateRoleRunUsage(attempts),
         };
       } catch (error) {
-        let classified = classifyError(error, request.signal);
+        let classified = classifyError(
+          error,
+          request.signal,
+          invalidOutputResponse !== undefined,
+        );
         const response =
           lastResponseFromError(error) ?? invalidOutputResponse ?? streamedResponse;
         if (

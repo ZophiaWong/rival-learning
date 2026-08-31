@@ -56,6 +56,7 @@ export class ScriptedRoleRunner implements RoleRunner {
 
     const attempts = [...(step.attempts ?? [])];
     const usage = step.usage ?? aggregateRoleRunUsage(attempts);
+    let outputDelivered = false;
 
     if (step.status === "await_abort") {
       if (!request.signal) {
@@ -90,7 +91,22 @@ export class ScriptedRoleRunner implements RoleRunner {
         return abortedRoleRunResult();
       }
       try {
-        await request.onOutputDelta?.(delta);
+        if (request.onOutputDelta) {
+          await request.onOutputDelta(delta);
+          outputDelivered = true;
+        }
+        if (request.signal?.aborted) {
+          return {
+            status: "failure" as const,
+            error: { code: "aborted" as const, message: "The model request was aborted." },
+            attempts: attempts.map((attempt, index) =>
+              index === attempts.length - 1
+                ? { ...attempt, outcome: "aborted" as const }
+                : attempt,
+            ),
+            usage,
+          };
+        }
       } catch {
         return {
           status: "failure" as const,
@@ -109,20 +125,40 @@ export class ScriptedRoleRunner implements RoleRunner {
     }
 
     if (step.status === "failure") {
+      if (outputDelivered && step.error.code !== "aborted") {
+        return {
+          status: "failure" as const,
+          error: {
+            code: "stream_interrupted" as const,
+            message: "The streamed model output was interrupted.",
+          },
+          attempts: attempts.map((attempt, index) =>
+            index === attempts.length - 1
+              ? { ...attempt, outcome: "stream_interrupted" as const }
+              : attempt,
+          ),
+          usage,
+        };
+      }
       return { ...step, attempts, usage };
     }
 
     const parsed = request.outputSchema.safeParse(step.value);
     if (!parsed.success) {
+      const code: "stream_interrupted" | "schema_invalid" = outputDelivered
+        ? "stream_interrupted"
+        : "schema_invalid";
       return {
         status: "failure" as const,
         error: {
-          code: "schema_invalid" as const,
-          message: "The model response did not match the required schema.",
+          code,
+          message: outputDelivered
+            ? "The streamed model output was interrupted."
+            : "The model response did not match the required schema.",
         },
         attempts: attempts.map((attempt, index) =>
           index === attempts.length - 1
-            ? { ...attempt, outcome: "schema_invalid" as const }
+            ? { ...attempt, outcome: code }
             : attempt,
         ),
         usage,
