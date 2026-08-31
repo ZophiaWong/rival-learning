@@ -41,12 +41,59 @@ describe("server configuration interface", () => {
 
     expect(status).toEqual({
       interviewer: {
-        configured: true,
+        status: "configured",
         provider: "openrouter",
         model: "provider/model-slug",
+        missingFields: [],
       },
-      candidate: { configured: false, provider: null, model: null },
-      judge: { configured: false, provider: null, model: null },
+      candidate: {
+        status: "missing",
+        provider: null,
+        model: null,
+        missingFields: ["provider", "model", "apiKey"],
+      },
+      judge: {
+        status: "missing",
+        provider: null,
+        model: null,
+        missingFields: ["provider", "model", "apiKey"],
+      },
+    });
+    expect(JSON.stringify(status)).not.toContain(secret);
+  });
+
+  it("reports incomplete role configuration without preventing startup", () => {
+    const config = parseServerConfig({
+      RIVAL_DATABASE_PATH: ".data/test.db",
+      RIVAL_HOST: "127.0.0.1",
+      RIVAL_INTERVIEWER_PROVIDER: "openrouter",
+    });
+
+    expect(getProviderConfigurationStatus(config).interviewer).toEqual({
+      status: "missing",
+      provider: "openrouter",
+      model: null,
+      missingFields: ["model", "apiKey"],
+    });
+  });
+
+  it("reports unsupported provider IDs without accepting an arbitrary endpoint", () => {
+    const secret = "sk-test-unsupported-must-not-leak";
+    const config = parseServerConfig({
+      RIVAL_DATABASE_PATH: ".data/test.db",
+      RIVAL_HOST: "127.0.0.1",
+      RIVAL_INTERVIEWER_PROVIDER: "deepseek-direct",
+      RIVAL_INTERVIEWER_MODEL: "deepseek-chat",
+      RIVAL_INTERVIEWER_API_KEY: secret,
+    });
+
+    const status = getProviderConfigurationStatus(config).interviewer;
+
+    expect(status).toEqual({
+      status: "unsupported",
+      provider: "deepseek-direct",
+      model: "deepseek-chat",
+      missingFields: [],
     });
     expect(JSON.stringify(status)).not.toContain(secret);
   });
