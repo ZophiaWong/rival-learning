@@ -111,11 +111,7 @@ type SessionCommand =
 
 Agents SDK 只执行一个角色的一次领域操作，包括结构化输出、受限重试与该角色允许的工具循环。它不保存或推进 `Session`，不使用 handoff 选择下一个角色，也不向 routes 暴露 SDK Session。
 
-`RoleRunner` 的 Interface 不暴露 SDK 类型。输入只包含角色、operation、instructions、input、Zod output schema 和可选 abort/delta callback；结果包含结构化值或稳定错误，以及每个实际请求的 attempt、request ID、HTTP 状态、耗时和 token usage。`SessionEngine` 只在后续步骤消费这些领域中立结果，不接触 SDK client、prompt payload 或 provider error body。
-
-production Adapter 为每个角色维护独立的 `OpenAI client → OpenAIProvider → Runner` 绑定。当前 Provider registry 只接受 `openrouter`；DeepSeek、Qwen 等模型先通过 OpenRouter 的精确 model slug 使用。未来直连必须新增受测 Provider Adapter，不接受来自 env、UI 或 HTTP 的任意 base URL。配置缺失或 provider ID 不支持不阻止应用启动，安全状态只报告 `configured | missing | unsupported`、缺失字段、provider 和 model。
-
-`RoleRunner` 独占单次角色调用的 retry、90 秒 attempt timeout、错误归类、stream delivery latch 和 usage ledger。SDK 与 `openai-node` 内部 retry 关闭；首次请求最多再进行两次无状态重试。delta 一旦成功交付，或 callback 失败，不自动重放。应用只执行用户配置的精确 provider/model，不因失败自动切换 provider 或模型。
+同一个 seam 可在明确配置后接入 DeepSeek 或其他 OpenAI-compatible 国内平台的直连 endpoint。应用只执行用户配置的精确 provider/model，不因失败自动切换 provider 或模型。
 
 ## 角色隔离
 
@@ -147,7 +143,7 @@ production Adapter 为每个角色维护独立的 `OpenAI client → OpenAIProvi
 
 ## Provider 与预算
 
-角色级 server env 分别指定受控 provider ID、API key 和精确 model slug。配置状态接口只返回 `configured | missing | unsupported`、缺失字段、安全的 provider 名称和 model slug，不返回 key、header 或完整环境变量。
+角色级 server env 分别指定 provider base URL、API key 引用和精确 model slug。配置状态接口只返回“是否已配置”、安全的 provider 名称和 model slug，不返回 key、header 或完整环境变量。
 
 OpenRouter production Adapter 使用 Chat Completions，并设置：
 

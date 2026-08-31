@@ -55,13 +55,11 @@
 
 **完成标准**：
 
-- SDK-neutral `RoleRunner` Interface 固定角色、operation、prompt 输入、Zod output schema、abort/delta callback，以及 typed result、逐请求 attempt 和 usage；SDK 类型不进入 `SessionEngine`。
-- 每个角色从 server env 读取受控 provider ID、独立 API key 和精确 model slug；缺失或不支持配置不阻止启动，并在调用前返回 typed error。
-- OpenRouter Adapter 使用 Chat Completions、实例级 client/provider/runner、关闭 hosted tracing 和内部 retry；request 带有架构文档规定的 privacy/routing 参数与最小 metadata。
-- transport/schema error 共用首次加两次无状态重试；测试确定复现 0、1、2 次 retry、最终失败、错误分类、`Retry-After` 和 usage 不完整语义。
-- Scripted 与 production Adapter 运行同一组 Interface contract tests；受控 mock server 证明应用不会切换 model/provider 或产生 tracing 请求。
-- 只有提供 callback 时才流式执行；首个 delta 交付后、callback 失败或用户 abort 后不自动重放。该 callback 在本步骤不接入 SSE/UI。
-- opt-in 三角色 OpenRouter live smoke 只使用合成输入并输出脱敏摘要；默认 test suite 和 CI 不发起外部请求。
+- 每个角色从 server env 读取精确 model slug，缺失配置在调用前返回 typed error。
+- request 带有架构文档规定的 OpenRouter privacy/routing 参数，hosted tracing 关闭。
+- Adapter 返回结构化 domain result、每个底层请求的 outcome 和 token usage。
+- transport/schema error 共用首次加两次重试；Scripted Adapter tests 能确定复现 0、1、2 次重试和最终失败。
+- 测试证明应用不会切换 model/provider，且已展示流式内容后不会自动重放。
 
 ### 2. 生成并执行单一 AttackChain
 
