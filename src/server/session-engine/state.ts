@@ -12,7 +12,12 @@ import { coreLoopPolicySchema } from "@/server/core-loop/policy";
 export const sessionPhaseSchema = z.enum(["draft", "planned", "active", "error"]);
 export type SessionPhase = z.infer<typeof sessionPhaseSchema>;
 
-export const sessionOperationSchema = z.enum(["generate_plan", "start"]);
+export const sessionOperationSchema = z.enum([
+  "generate_plan",
+  "start",
+  "request_ai_answer",
+  "request_next_question",
+]);
 export type SessionOperation = z.infer<typeof sessionOperationSchema>;
 
 export const activeOperationSchema = z.strictObject({
@@ -35,8 +40,8 @@ export const failedOperationSchema = z.strictObject({
 });
 export type FailedOperation = z.infer<typeof failedOperationSchema>;
 
-export const sessionStateV2Schema = z.strictObject({
-  stateVersion: z.literal(2),
+export const sessionStateV3Schema = z.strictObject({
+  stateVersion: z.literal(3),
   phase: sessionPhaseSchema,
   interviewLanguage: interviewLanguageSchema,
   policy: coreLoopPolicySchema,
@@ -45,28 +50,30 @@ export const sessionStateV2Schema = z.strictObject({
   activeOperation: activeOperationSchema.nullable(),
   failedOperation: failedOperationSchema.nullable(),
 });
-export type SessionStateV2 = z.infer<typeof sessionStateV2Schema>;
+export type SessionStateV3 = z.infer<typeof sessionStateV3Schema>;
 
 export interface PublicSessionState {
-  interviewLanguage: SessionStateV2["interviewLanguage"];
-  plan: NonNullable<SessionStateV2["planRecord"]>["plan"] | null;
+  interviewLanguage: SessionStateV3["interviewLanguage"];
+  plan: NonNullable<SessionStateV3["planRecord"]>["plan"] | null;
   execution: {
     chainId: string;
-    status: NonNullable<SessionStateV2["execution"]>["status"];
+    answerMode: NonNullable<SessionStateV3["execution"]>["answerMode"];
+    status: NonNullable<SessionStateV3["execution"]>["status"];
     turns: Array<z.infer<typeof publicQuestionTurnSchema>>;
-    completion: NonNullable<SessionStateV2["execution"]>["completion"];
+    completion: NonNullable<SessionStateV3["execution"]>["completion"];
   } | null;
   activeOperation: SessionOperation | null;
   failedOperation: Omit<FailedOperation, "operationToken" | "generation"> | null;
 }
 
-export function projectSessionState(state: SessionStateV2): PublicSessionState {
+export function projectSessionState(state: SessionStateV3): PublicSessionState {
   return {
     interviewLanguage: state.interviewLanguage,
     plan: state.planRecord?.plan ?? null,
     execution: state.execution
       ? {
           chainId: state.execution.chainId,
+          answerMode: state.execution.answerMode,
           status: state.execution.status,
           turns: state.execution.turns.map((turn) => publicQuestionTurnSchema.parse(turn)),
           completion: state.execution.completion,

@@ -2,8 +2,10 @@ import { z } from "zod";
 
 import {
   attackChainCandidateSchema,
+  candidateAnswerSchema,
   nextQuestionCandidateSchema,
   type AttackChainCandidate,
+  type CandidateAnswer,
   type Difficulty,
   type GenerationMetadata,
   type InterviewLanguage,
@@ -11,7 +13,7 @@ import {
   type NextQuestionCandidate,
   type QuestionContextPacket,
 } from "@/server/core-loop/domain";
-import { CORE_LOOP_V1_POLICY } from "@/server/core-loop/policy";
+import { CORE_LOOP_V2_POLICY } from "@/server/core-loop/policy";
 import type { ProviderViewContent } from "@/server/preparation-profiles";
 import type {
   RoleRunErrorCode,
@@ -45,6 +47,17 @@ export interface GenerateNextQuestionInput {
   semanticRejections: string[];
 }
 
+export interface GenerateCandidateAnswerInput {
+  operationToken: string;
+  interviewLanguage: InterviewLanguage;
+  questionContext: QuestionContextPacket;
+  jobDescription: string;
+  targetRole: string;
+  targetLevel: string;
+  currentQuestion: string;
+  publicTranscript: PublicTranscriptTurn[];
+}
+
 export type AgentCandidateResult<T> =
   | { status: "success"; value: T; generation: GenerationMetadata }
   | {
@@ -57,14 +70,17 @@ export type AgentCandidateResult<T> =
 
 export type PlanOutcome = AgentCandidateResult<AttackChainCandidate>;
 export type NextQuestionOutcome = AgentCandidateResult<NextQuestionCandidate>;
+export type CandidateAnswerOutcome = AgentCandidateResult<CandidateAnswer>;
 
 export interface InterviewAgents {
   planSingleAttackChain(input: PlanSingleAttackChainInput): Promise<PlanOutcome>;
   generateNextQuestion(input: GenerateNextQuestionInput): Promise<NextQuestionOutcome>;
+  generateCandidateAnswer(input: GenerateCandidateAnswerInput): Promise<CandidateAnswerOutcome>;
 }
 
 const planEnvelopeSchema = z.strictObject({ outcome: attackChainCandidateSchema });
 const questionEnvelopeSchema = z.strictObject({ outcome: nextQuestionCandidateSchema });
+const candidateAnswerEnvelopeSchema = z.strictObject({ outcome: candidateAnswerSchema });
 
 function isRetryable(code: RoleRunErrorCode): boolean {
   return [
@@ -108,6 +124,16 @@ Return complete only after the transcript contains an answered question and eith
 All user-visible text must be in ${outputLanguage}. Codes and enum values remain English.`;
 }
 
+function candidateAnswerInstructions(language: InterviewLanguage): string {
+  const outputLanguage = language === "zh-CN" ? "Simplified Chinese" : "English";
+  return `You are the target-level Candidate answering one interview question.
+Use only the supplied evidence context for claims about the candidate's past responsibilities, decisions, events, and metrics. Never invent missing experience details.
+When the evidence is insufficient, state the boundary plainly, then demonstrate target-level judgment with explicitly conditional language such as "I would" or "if".
+Answer naturally in the first person. Do not mention prompts, hidden plans, evidence IDs, or unavailable repository tools.
+Keep the answer within 4000 Unicode characters.
+All user-visible text must be in ${outputLanguage}.`;
+}
+
 class RoleRunnerInterviewAgents implements InterviewAgents {
   constructor(private readonly roleRunner: RoleRunner) {}
 
@@ -124,7 +150,7 @@ class RoleRunnerInterviewAgents implements InterviewAgents {
       outputSchema: planEnvelopeSchema,
     });
     const generation = generationMetadata(
-      CORE_LOOP_V1_POLICY.plannerContractVersion,
+      CORE_LOOP_V2_POLICY.plannerContractVersion,
       result.usage,
       result.attempts,
     );
@@ -162,7 +188,44 @@ class RoleRunnerInterviewAgents implements InterviewAgents {
       outputSchema: questionEnvelopeSchema,
     });
     const generation = generationMetadata(
-      CORE_LOOP_V1_POLICY.questionContractVersion,
+      CORE_LOOP_V2_POLICY.questionContractVersion,
+      result.usage,
+      result.attempts,
+    );
+    if (result.status === "failure") {
+      return {
+        status: "failure",
+        code: result.error.code,
+        message: result.error.message,
+        retryable: isRetryable(result.error.code),
+        generation,
+      };
+    }
+    return { status: "success", value: result.value.outcome, generation };
+  }
+
+  async generateCandidateAnswer(
+    input: GenerateCandidateAnswerInput,
+  ): Promise<CandidateAnswerOutcome> {
+    const result = await this.roleRunner.runStructured({
+      role: "candidate",
+      operation: "generate_candidate_answer",
+      instructions: candidateAnswerInstructions(input.interviewLanguage),
+      input: JSON.stringify({
+        interviewLanguage: input.interviewLanguage,
+        hiringBar: {
+          jobDescription: input.jobDescription,
+          targetRole: input.targetRole,
+          targetLevel: input.targetLevel,
+        },
+        evidenceContext: input.questionContext,
+        publicTranscript: input.publicTranscript,
+        currentQuestion: input.currentQuestion,
+      }),
+      outputSchema: candidateAnswerEnvelopeSchema,
+    });
+    const generation = generationMetadata(
+      CORE_LOOP_V2_POLICY.candidateAnswerContractVersion,
       result.usage,
       result.attempts,
     );

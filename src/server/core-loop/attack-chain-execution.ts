@@ -19,10 +19,35 @@ export type QuestionSemanticRejectionReason =
   | "unknown_evidence_anchor"
   | "duplicate_evidence_reference"
   | "duplicate_question"
-  | "complete_before_answer";
+  | "complete_before_answer"
+  | "answer_actor_mismatch";
 
 export type AttackChainPendingEvent =
-  | { type: "question_presented"; payload: { chainId: string; turn: PublicQuestionTurn } }
+  | {
+      type: "question_presented";
+      payload: { chainId: string; turn: PublicQuestionTurn; generation: GenerationMetadata };
+    }
+  | {
+      type: "answer_recorded";
+      payload:
+        | {
+            chainId: string;
+            turnId: string;
+            actor: "candidate";
+            text: string;
+            generation: GenerationMetadata;
+          }
+        | { chainId: string; turnId: string; actor: "human"; text: string };
+    }
+  | {
+      type: "control_taken_over";
+      payload: {
+        chainId: string;
+        turnId: string;
+        from: "candidate";
+        to: "human";
+      };
+    }
   | {
       type: "attack_chain_completed";
       payload: {
@@ -43,6 +68,7 @@ export type AttackChainTransitionResult =
 export function createAttackChainExecutionState(chainId: string): AttackChainExecutionState {
   return attackChainExecutionStateSchema.parse({
     chainId,
+    answerMode: "a2a",
     status: "ready_for_next_question",
     turns: [],
     normalizedQuestionKeys: [],
@@ -141,7 +167,11 @@ export function acceptNextQuestionCandidate(input: {
     events: [
       {
         type: "question_presented",
-        payload: { chainId: chain.id, turn: publicQuestionTurnSchema.parse(turn) },
+        payload: {
+          chainId: chain.id,
+          turn: publicQuestionTurnSchema.parse(turn),
+          generation,
+        },
       },
     ],
   };
@@ -150,8 +180,15 @@ export function acceptNextQuestionCandidate(input: {
 export function settleQuestionTurn(input: {
   state: AttackChainExecutionState;
   questionTurnId: string;
-  actor: "candidate" | "human";
+  actor: "human";
   answer: string;
+  now: string;
+} | {
+  state: AttackChainExecutionState;
+  questionTurnId: string;
+  actor: "candidate";
+  answer: string;
+  generation: GenerationMetadata;
   now: string;
 }): AttackChainTransitionResult {
   const active = input.state.turns.at(-1);
@@ -163,8 +200,18 @@ export function settleQuestionTurn(input: {
   ) {
     return { status: "rejected", reason: "execution_not_ready" };
   }
+  if (
+    (input.state.answerMode === "a2a" && input.actor !== "candidate") ||
+    (input.state.answerMode === "a2h" && input.actor !== "human")
+  ) {
+    return { status: "rejected", reason: "answer_actor_mismatch" };
+  }
   const answer = input.answer.trim();
   if (!answer) return { status: "rejected", reason: "execution_not_ready" };
+  const recordedAnswer =
+    input.actor === "candidate"
+      ? { actor: input.actor, text: answer, generation: input.generation }
+      : { actor: input.actor, text: answer };
   return {
     status: "accepted",
     state: attackChainExecutionStateSchema.parse({
@@ -176,12 +223,60 @@ export function settleQuestionTurn(input: {
               ...turn,
               status: "settled",
               settledAt: input.now,
-              answer: { actor: input.actor, text: answer },
+              answer: recordedAnswer,
             }
           : turn,
       ),
     }),
-    events: [],
+    events: [
+      {
+        type: "answer_recorded",
+        payload:
+          input.actor === "candidate"
+            ? {
+                chainId: input.state.chainId,
+                turnId: active.id,
+                actor: input.actor,
+                text: answer,
+                generation: input.generation,
+              }
+            : {
+                chainId: input.state.chainId,
+                turnId: active.id,
+                actor: input.actor,
+                text: answer,
+              },
+      },
+    ],
+  };
+}
+
+export function takeOverQuestionTurn(
+  state: AttackChainExecutionState,
+): AttackChainTransitionResult {
+  const active = state.turns.at(-1);
+  if (
+    state.answerMode !== "a2a" ||
+    state.status !== "awaiting_answer" ||
+    !active ||
+    active.status !== "awaiting_answer"
+  ) {
+    return { status: "rejected", reason: "execution_not_ready" };
+  }
+  return {
+    status: "accepted",
+    state: attackChainExecutionStateSchema.parse({ ...state, answerMode: "a2h" }),
+    events: [
+      {
+        type: "control_taken_over",
+        payload: {
+          chainId: state.chainId,
+          turnId: active.id,
+          from: "candidate",
+          to: "human",
+        },
+      },
+    ],
   };
 }
 

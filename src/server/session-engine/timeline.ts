@@ -1,6 +1,8 @@
 import { z } from "zod";
 
 import {
+  answerTextSchema,
+  candidateAnswerGenerationMetadataSchema,
   generationMetadataSchema,
   generationUsageSchema,
   interviewLanguageSchema,
@@ -46,6 +48,35 @@ export const timelineEventSchema = z.discriminatedUnion("type", [
       chainId: z.string().min(1),
       turn: publicQuestionTurnSchema,
       generation: generationMetadataSchema,
+    }),
+  }),
+  z.strictObject({
+    ...timelineEnvelope,
+    type: z.literal("answer_recorded"),
+    payload: z.discriminatedUnion("actor", [
+      z.strictObject({
+        chainId: z.string().min(1),
+        turnId: z.string().min(1),
+        actor: z.literal("candidate"),
+        text: answerTextSchema,
+        generation: candidateAnswerGenerationMetadataSchema,
+      }),
+      z.strictObject({
+        chainId: z.string().min(1),
+        turnId: z.string().min(1),
+        actor: z.literal("human"),
+        text: answerTextSchema,
+      }),
+    ]),
+  }),
+  z.strictObject({
+    ...timelineEnvelope,
+    type: z.literal("control_taken_over"),
+    payload: z.strictObject({
+      chainId: z.string().min(1),
+      turnId: z.string().min(1),
+      from: z.literal("candidate"),
+      to: z.literal("human"),
     }),
   }),
   z.strictObject({

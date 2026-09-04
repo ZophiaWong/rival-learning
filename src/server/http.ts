@@ -6,7 +6,12 @@ import {
   ProfileValidationError,
   ProviderViewNotConfirmedError,
 } from "@/server/preparation-profiles";
-import { interviewLanguageSchema } from "@/server/core-loop/domain";
+import { DatabaseResetRequiredError } from "@/server/persistence/migrate";
+import { SessionNotFoundError } from "@/server/session-engine";
+import {
+  answerTextSchema,
+  interviewLanguageSchema,
+} from "@/server/core-loop/domain";
 
 export const sessionCreateRequestSchema = z.strictObject({
   sessionId: z.uuid(),
@@ -14,9 +19,17 @@ export const sessionCreateRequestSchema = z.strictObject({
   interviewLanguage: interviewLanguageSchema,
 });
 
-export const foundationActionRequestSchema = z.strictObject({
-  type: z.enum(["generate_plan", "start"]),
-});
+export const sessionActionRequestSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("generate_plan") }),
+  z.strictObject({ type: z.literal("start") }),
+  z.strictObject({ type: z.literal("request_ai_answer") }),
+  z.strictObject({ type: z.literal("request_next_question") }),
+  z.strictObject({ type: z.literal("take_over") }),
+  z.strictObject({
+    type: z.literal("submit_human_answer"),
+    answer: answerTextSchema,
+  }),
+]);
 
 const idempotencyKeySchema = z
   .string()
@@ -38,6 +51,10 @@ function validationFields(error: z.ZodError): string[] {
   return [...new Set(error.issues.map((issue) => String(issue.path[0] ?? "body")))]
     .filter(Boolean)
     .sort();
+}
+
+function hasErrorCode(error: unknown, code: string): error is Error & { code: string } {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 export async function parseJsonRequest<T>(
@@ -100,7 +117,19 @@ export function errorResponse(error: unknown): NextResponse {
       { status: 404 },
     );
   }
+  if (error instanceof SessionNotFoundError || hasErrorCode(error, "session_not_found")) {
+    return NextResponse.json(
+      { error: { code: error.code, message: error.message } },
+      { status: 404 },
+    );
+  }
   if (error instanceof ProviderViewNotConfirmedError) {
+    return NextResponse.json(
+      { error: { code: error.code, message: error.message } },
+      { status: 409 },
+    );
+  }
+  if (error instanceof DatabaseResetRequiredError) {
     return NextResponse.json(
       { error: { code: error.code, message: error.message } },
       { status: 409 },
