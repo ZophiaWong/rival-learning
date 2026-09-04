@@ -15,6 +15,13 @@
       "when": 1787928239183,
       "tag": "0001_idempotency-command-fingerprint",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788480000000,
+      "tag": "0002_step2_session_state",
+      "breakpoints": true
     }
   ]
 }

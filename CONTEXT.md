@@ -20,9 +20,17 @@ _Avoid_：Anonymized profile、Sanitized input
 基于一个 `ProfileSnapshot` 开展的独立面试学习过程，不继承其他运行的差距或难度。
 _Avoid_：Interview、Run（指完整学习过程时）
 
+**InterviewPlan**：
+`Session` 中不可变、由证据支撑的 `AttackChain` 规划；它固定追问目标与边界，但不是预生成的问题列表。
+_Avoid_：Question list、Script、Mutable plan
+
 **AttackChain**：
 围绕一个知识目标展开、具有明确深度上限的连续追问策略。
 _Avoid_：Topic、Question list、Thread
+
+**EvidenceAnchor**：
+对该 `Session` 所用 `ProviderView` 中精确连续行范围的本地可验证引用；附近上下文不自动成为证据。
+_Avoid_：Context snippet、Model citation、Source hint
 
 **QuestionTurn**：
 从一个问题展示给回答者时开始计数的一轮；切换回答者或对同一问题重试仍属于原轮。

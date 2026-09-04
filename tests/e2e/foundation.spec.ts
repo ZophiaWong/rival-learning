@@ -6,14 +6,21 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
   page,
 }) => {
   let sessionCreateRequest:
-    | { body: { profileId?: string; sessionId?: string }; idempotencyKey?: string }
+    | {
+        body: { profileId?: string; sessionId?: string; interviewLanguage?: string };
+        idempotencyKey?: string;
+      }
     | undefined;
   let eventStreamRequests = 0;
   page.on("request", (request) => {
     const url = new URL(request.url());
     if (request.method() === "POST" && url.pathname === "/api/sessions") {
       sessionCreateRequest = {
-        body: request.postDataJSON() as { profileId?: string; sessionId?: string },
+        body: request.postDataJSON() as {
+          profileId?: string;
+          sessionId?: string;
+          interviewLanguage?: string;
+        },
         idempotencyKey: request.headers()["idempotency-key"],
       };
     }
@@ -48,6 +55,7 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
 
   await page.getByRole("button", { name: "确认 ProviderView" }).click();
   await expect(page.getByRole("status")).toContainText("ProviderView 已确认");
+  await page.getByLabel("面试语言").selectOption("zh-CN");
   await page.getByRole("button", { name: "创建 Session" }).click();
 
   await expect(page.getByRole("status")).toContainText("不可变 ProfileSnapshot");
@@ -55,18 +63,23 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
     /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
   );
   expect(sessionCreateRequest?.idempotencyKey).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+  expect(sessionCreateRequest?.body.interviewLanguage).toBe("zh-CN");
   await expect.poll(() => eventStreamRequests).toBeGreaterThan(0);
   await expect(page.getByLabel("Session timeline")).toContainText("session_created");
-  await page.getByRole("button", { name: "生成 Fake Plan" }).click();
-  await expect(page.getByLabel("Session timeline")).toContainText("plan_generated");
+  await page.getByRole("button", { name: "生成 InterviewPlan" }).click();
+  await expect(page.getByLabel("Session timeline")).toContainText("interview_plan_generated");
   await page.getByRole("button", { name: "启动 Session" }).click();
-  await expect(page.getByRole("status")).toContainText("Foundation Session 已启动");
+  await expect(page.getByRole("status")).toContainText("Session 已启动并展示首题");
   await expect(page.getByLabel("Session timeline")).toContainText("session_started");
+  await expect(page.getByText("这项成果中你亲自负责的范围是什么，哪项关键决策由你做出？")).toBeVisible();
   await expect(
     page.getByLabel("Session timeline").locator("li").filter({ hasText: "session_created" }),
   ).toHaveCount(1);
   await expect(
-    page.getByLabel("Session timeline").locator("li").filter({ hasText: "plan_generated" }),
+    page.getByLabel("Session timeline").locator("li").filter({ hasText: "interview_plan_generated" }),
+  ).toHaveCount(1);
+  await expect(
+    page.getByLabel("Session timeline").locator("li").filter({ hasText: "question_presented" }),
   ).toHaveCount(1);
   await expect(
     page.getByLabel("Session timeline").locator("li").filter({ hasText: "session_started" }),

@@ -4,6 +4,7 @@ import {
   type ModelAttempt,
   type RoleRunErrorCode,
   type RoleRunner,
+  type RoleRunRequest,
   type RoleRunUsage,
 } from "./index";
 
@@ -13,7 +14,7 @@ interface ScriptedRoleRunStepBase {
   deltas?: string[];
 }
 
-export type ScriptedRoleRunStep =
+export type ScriptedRoleRunValue =
   | (ScriptedRoleRunStepBase & {
       status: "success";
       value: unknown;
@@ -29,6 +30,10 @@ export type ScriptedRoleRunStep =
       status: "await_abort";
     });
 
+export type ScriptedRoleRunStep =
+  | ScriptedRoleRunValue
+  | ((request: RoleRunRequest<unknown>) => ScriptedRoleRunValue | Promise<ScriptedRoleRunValue>);
+
 export class ScriptedRoleRunner implements RoleRunner {
   private readonly steps: ScriptedRoleRunStep[];
 
@@ -41,8 +46,8 @@ export class ScriptedRoleRunner implements RoleRunner {
       return abortedRoleRunResult();
     }
 
-    const step = this.steps.shift();
-    if (!step) {
+    const queuedStep = this.steps.shift();
+    if (!queuedStep) {
       return {
         status: "failure" as const,
         error: {
@@ -53,6 +58,11 @@ export class ScriptedRoleRunner implements RoleRunner {
         usage: aggregateRoleRunUsage([]),
       };
     }
+
+    const step =
+      typeof queuedStep === "function"
+        ? await queuedStep(request as RoleRunRequest<unknown>)
+        : queuedStep;
 
     const attempts = [...(step.attempts ?? [])];
     const usage = step.usage ?? aggregateRoleRunUsage(attempts);

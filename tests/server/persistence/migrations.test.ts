@@ -41,6 +41,106 @@ describe("database migration interface", () => {
     ]);
   });
 
+  it("removes legacy Sessions and their dependent facts while preserving Profiles and ProviderViews", () => {
+    const directory = mkdtempSync(join(tmpdir(), "rival-learning-step2-migration-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "app.db");
+    migrateDatabase(databasePath);
+
+    const database = new Database(databasePath);
+    database.pragma("foreign_keys = ON");
+    const timestamp = Date.now();
+    database
+      .prepare(
+        `insert into preparation_profiles
+          (id, name, resume, project_notes, job_description, target_role, target_level,
+           content_hash, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "profile-legacy",
+        "Preserved profile",
+        "Resume",
+        "",
+        "JD",
+        "Engineer",
+        "Senior",
+        "hash",
+        timestamp,
+        timestamp,
+      );
+    database
+      .prepare(
+        `insert into provider_views
+          (id, profile_id, source_content_hash, redaction_version, content_json,
+           confirmed_at, created_at)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "view-legacy",
+        "profile-legacy",
+        "hash",
+        "contact-v1",
+        "{}",
+        timestamp,
+        timestamp,
+      );
+    database
+      .prepare(
+        `insert into sessions
+          (id, source_profile_id, profile_snapshot_json, provider_view_json, redaction_version,
+           status, state_json, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "session-legacy",
+        "profile-legacy",
+        "{}",
+        "{}",
+        "contact-v1",
+        "draft",
+        '{"plan":null}',
+        timestamp,
+        timestamp,
+      );
+    database
+      .prepare(
+        `insert into session_timeline
+          (session_id, sequence, event_type, payload_json, created_at)
+         values (?, ?, ?, ?, ?)`,
+      )
+      .run("session-legacy", 1, "session_created", "{}", timestamp);
+    database
+      .prepare(
+        `insert into idempotency_results
+          (session_id, idempotency_key, command_type, command_fingerprint, result_json, created_at)
+         values (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "session-legacy",
+        "create-legacy",
+        "create_session",
+        "fingerprint",
+        '{"status":"applied"}',
+        timestamp,
+      );
+    const latestMigration = database
+      .prepare("select id from __drizzle_migrations order by created_at desc limit 1")
+      .get() as { id: number };
+    database.prepare("delete from __drizzle_migrations where id = ?").run(latestMigration.id);
+    database.close();
+
+    migrateDatabase(databasePath);
+
+    const verified = new Database(databasePath, { readonly: true });
+    expect(verified.prepare("select count(*) as count from sessions").get()).toEqual({ count: 0 });
+    expect(verified.prepare("select count(*) as count from session_timeline").get()).toEqual({ count: 0 });
+    expect(verified.prepare("select count(*) as count from idempotency_results").get()).toEqual({ count: 0 });
+    expect(verified.prepare("select count(*) as count from preparation_profiles").get()).toEqual({ count: 1 });
+    expect(verified.prepare("select count(*) as count from provider_views").get()).toEqual({ count: 1 });
+    verified.close();
+  });
+
   it("keeps committed timeline events immutable", () => {
     const directory = mkdtempSync(join(tmpdir(), "rival-learning-timeline-"));
     temporaryDirectories.push(directory);

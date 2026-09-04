@@ -28,6 +28,7 @@ export default defineConfig({
       PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`,
       RIVAL_DATABASE_PATH: e2eDatabasePath,
       RIVAL_HOST: "127.0.0.1",
+      RIVAL_TEST_SCRIPTED_ROLE_RUNNER: "1",
     },
     url: e2eBaseUrl,
     reuseExistingServer: !process.env.CI,

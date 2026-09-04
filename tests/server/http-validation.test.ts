@@ -56,12 +56,12 @@ describe("HTTP runtime validation", () => {
     const response = await createSession(
       jsonRequest(
         "/api/sessions",
-        { sessionId: "not-a-uuid", profileId: 42 },
+        { sessionId: "not-a-uuid", profileId: 42, interviewLanguage: "fr-FR" },
         "create-1",
       ),
     );
 
-    await expectInvalidRequest(response, ["profileId", "sessionId"]);
+    await expectInvalidRequest(response, ["interviewLanguage", "profileId", "sessionId"]);
   });
 
   it.each([
@@ -75,6 +75,7 @@ describe("HTTP runtime validation", () => {
         {
           sessionId: "9b4cd4fb-fc4b-4a01-8288-31c5cd678a2a",
           profileId: "profile-1",
+          interviewLanguage: "zh-CN",
         },
         key,
       ),

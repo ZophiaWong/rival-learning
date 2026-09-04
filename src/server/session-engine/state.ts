@@ -1,0 +1,88 @@
+import { z } from "zod";
+
+import {
+  attackChainExecutionStateSchema,
+  generationMetadataSchema,
+  interviewLanguageSchema,
+  interviewPlanRecordSchema,
+  publicQuestionTurnSchema,
+} from "@/server/core-loop/domain";
+import { coreLoopPolicySchema } from "@/server/core-loop/policy";
+
+export const sessionPhaseSchema = z.enum(["draft", "planned", "active", "error"]);
+export type SessionPhase = z.infer<typeof sessionPhaseSchema>;
+
+export const sessionOperationSchema = z.enum(["generate_plan", "start"]);
+export type SessionOperation = z.infer<typeof sessionOperationSchema>;
+
+export const activeOperationSchema = z.strictObject({
+  type: sessionOperationSchema,
+  token: z.string().min(1),
+  priorPhase: sessionPhaseSchema.exclude(["error"]),
+  startedAt: z.iso.datetime(),
+});
+
+export const failedOperationSchema = z.strictObject({
+  type: sessionOperationSchema,
+  priorPhase: sessionPhaseSchema.exclude(["error"]),
+  operationToken: z.string().min(1),
+  code: z.string().min(1),
+  userMessage: z.string().min(1),
+  retrySafety: z.enum(["safe_to_retry", "manual_review"]),
+  rejectionCounts: z.record(z.string(), z.number().int().min(1)),
+  lastRejectionReason: z.string().min(1).nullable(),
+  generation: generationMetadataSchema,
+});
+export type FailedOperation = z.infer<typeof failedOperationSchema>;
+
+export const sessionStateV2Schema = z.strictObject({
+  stateVersion: z.literal(2),
+  phase: sessionPhaseSchema,
+  interviewLanguage: interviewLanguageSchema,
+  policy: coreLoopPolicySchema,
+  planRecord: interviewPlanRecordSchema.nullable(),
+  execution: attackChainExecutionStateSchema.nullable(),
+  activeOperation: activeOperationSchema.nullable(),
+  failedOperation: failedOperationSchema.nullable(),
+});
+export type SessionStateV2 = z.infer<typeof sessionStateV2Schema>;
+
+export interface PublicSessionState {
+  interviewLanguage: SessionStateV2["interviewLanguage"];
+  plan: NonNullable<SessionStateV2["planRecord"]>["plan"] | null;
+  execution: {
+    chainId: string;
+    status: NonNullable<SessionStateV2["execution"]>["status"];
+    turns: Array<z.infer<typeof publicQuestionTurnSchema>>;
+    completion: NonNullable<SessionStateV2["execution"]>["completion"];
+  } | null;
+  activeOperation: SessionOperation | null;
+  failedOperation: Omit<FailedOperation, "operationToken" | "generation"> | null;
+}
+
+export function projectSessionState(state: SessionStateV2): PublicSessionState {
+  return {
+    interviewLanguage: state.interviewLanguage,
+    plan: state.planRecord?.plan ?? null,
+    execution: state.execution
+      ? {
+          chainId: state.execution.chainId,
+          status: state.execution.status,
+          turns: state.execution.turns.map((turn) => publicQuestionTurnSchema.parse(turn)),
+          completion: state.execution.completion,
+        }
+      : null,
+    activeOperation: state.activeOperation?.type ?? null,
+    failedOperation: state.failedOperation
+      ? {
+          type: state.failedOperation.type,
+          priorPhase: state.failedOperation.priorPhase,
+          code: state.failedOperation.code,
+          userMessage: state.failedOperation.userMessage,
+          retrySafety: state.failedOperation.retrySafety,
+          rejectionCounts: state.failedOperation.rejectionCounts,
+          lastRejectionReason: state.failedOperation.lastRejectionReason,
+        }
+      : null,
+  };
+}

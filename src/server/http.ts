@@ -6,10 +6,12 @@ import {
   ProfileValidationError,
   ProviderViewNotConfirmedError,
 } from "@/server/preparation-profiles";
+import { interviewLanguageSchema } from "@/server/core-loop/domain";
 
 export const sessionCreateRequestSchema = z.strictObject({
   sessionId: z.uuid(),
   profileId: z.string().trim().min(1),
+  interviewLanguage: interviewLanguageSchema,
 });
 
 export const foundationActionRequestSchema = z.strictObject({

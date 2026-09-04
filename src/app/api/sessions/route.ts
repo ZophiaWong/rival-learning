@@ -22,6 +22,7 @@ export async function POST(request: Request) {
       type: "create_session",
       sessionId: body.sessionId,
       profileId: body.profileId,
+      interviewLanguage: body.interviewLanguage,
       idempotencyKey,
     });
     return NextResponse.json(result, { status: result.status === "applied" ? 201 : 409 });
