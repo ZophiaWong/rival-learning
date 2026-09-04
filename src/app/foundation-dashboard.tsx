@@ -8,6 +8,7 @@ import type {
   ProviderView,
 } from "@/server/preparation-profiles";
 import type { SessionView, TimelineEvent } from "@/server/session-engine";
+import type { InterviewLanguage } from "@/server/core-loop/domain";
 
 const emptyInput: PreparationProfileInput = {
   name: "",
@@ -47,6 +48,7 @@ export function FoundationDashboard() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [providerView, setProviderView] = useState<ProviderView | null>(null);
   const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
+  const [interviewLanguage, setInterviewLanguage] = useState<InterviewLanguage>("zh-CN");
   const [form, setForm] = useState<PreparationProfileInput>(emptyInput);
   const [message, setMessage] = useState("准备创建第一个 PreparationProfile。");
   const [busy, setBusy] = useState(true);
@@ -256,7 +258,11 @@ export function FoundationDashboard() {
             "Content-Type": "application/json",
             "Idempotency-Key": idempotencyKey,
           },
-          body: JSON.stringify({ sessionId, profileId: selectedProfileId }),
+          body: JSON.stringify({
+            sessionId,
+            profileId: selectedProfileId,
+            interviewLanguage,
+          }),
         },
         1,
       );
@@ -288,7 +294,7 @@ export function FoundationDashboard() {
         1,
       );
       await Promise.all([loadSessions(), loadSessionDetail(selectedSessionId)]);
-      setMessage(type === "generate_plan" ? "Fake plan 已生成。" : "Foundation Session 已启动。");
+      setMessage(type === "generate_plan" ? "InterviewPlan 已生成。" : "Session 已启动并展示首题。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Session action 失败");
     } finally {
@@ -302,7 +308,7 @@ export function FoundationDashboard() {
     <main className="mx-auto min-h-screen max-w-7xl px-5 py-10">
       <header className="mb-8 flex flex-col gap-2 border-b border-[var(--border)] pb-6">
         <p className="text-sm font-semibold uppercase tracking-[0.2em] text-[var(--accent)]">
-          Rival Learning · 01 Foundation
+          Rival Learning · 02 Core Loop
         </p>
         <h1 className="text-4xl font-semibold tracking-tight">PreparationProfile 工作台</h1>
         <p className="text-[var(--muted)]" role="status">
@@ -481,6 +487,19 @@ export function FoundationDashboard() {
                   </div>
                 ))}
               </div>
+              <label className="mt-4 grid gap-1 text-sm font-medium">
+                面试语言
+                <select
+                  className="rounded-lg border border-[var(--border)] px-3 py-2"
+                  onChange={(event) =>
+                    setInterviewLanguage(event.target.value as InterviewLanguage)
+                  }
+                  value={interviewLanguage}
+                >
+                  <option value="zh-CN">简体中文</option>
+                  <option value="en-US">English</option>
+                </select>
+              </label>
               <button
                 className="mt-4 w-full rounded-lg border border-[var(--accent)] px-3 py-2 font-semibold text-[var(--accent)] disabled:opacity-40"
                 disabled={busy || !providerView.confirmedAt}
@@ -512,6 +531,9 @@ export function FoundationDashboard() {
                 {session.status}
               </span>
               <span className="mt-2 block text-xs text-[var(--muted)]">{session.id}</span>
+              <span className="mt-1 block text-xs text-[var(--muted)]">
+                {session.state.interviewLanguage}
+              </span>
             </button>
           ))}
         </div>
@@ -525,24 +547,55 @@ export function FoundationDashboard() {
                 onClick={() => void runSessionAction("generate_plan")}
                 type="button"
               >
-                生成 Fake Plan
+                生成 InterviewPlan
               </button>
               <button
                 className="rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
-                disabled={busy || selectedSession.status !== "planned"}
+                disabled={
+                  busy ||
+                  selectedSession.status !== "planned" ||
+                  selectedSession.state.plan?.attackChains[0].status !== "ready"
+                }
                 onClick={() => void runSessionAction("start")}
                 type="button"
               >
                 启动 Session
               </button>
             </div>
-            {selectedSession.state.plan ? (
-              <p className="text-sm">
-                <strong>{selectedSession.state.plan.objective}</strong>
-                <br />
-                Evidence: {selectedSession.state.plan.evidenceAnchor}
-              </p>
+            {selectedSession.state.plan?.attackChains[0].status === "ready" ? (
+              <div className="grid gap-2 text-sm">
+                <strong>{selectedSession.state.plan.attackChains[0].knowledgeTarget}</strong>
+                <p>
+                  难度：{selectedSession.state.plan.attackChains[0].initialDifficulty} · 计划深度：
+                  {selectedSession.state.plan.attackChains[0].estimatedDepth}
+                </p>
+                <ul className="list-disc pl-5">
+                  {selectedSession.state.plan.attackChains[0].evidenceAnchors.map((anchor) => (
+                    <li key={anchor.id}>
+                      {anchor.source} L{anchor.startLine}–L{anchor.endLine}: {anchor.excerpt}
+                    </li>
+                  ))}
+                </ul>
+              </div>
             ) : null}
+            {selectedSession.state.plan?.attackChains[0].status === "needs_input" ? (
+              <div className="grid gap-2 text-sm">
+                <strong>需要补充资料：{selectedSession.state.plan.attackChains[0].reasonCode}</strong>
+                <ul className="list-disc pl-5">
+                  {selectedSession.state.plan.attackChains[0].requestedEvidence.map((item) => (
+                    <li key={item.kind}>{item.prompt}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+            {selectedSession.state.execution?.turns.map((turn) => (
+              <article className="rounded-lg border border-[var(--border)] bg-white p-3" key={turn.id}>
+                <p className="text-xs uppercase tracking-wide text-[var(--muted)]">
+                  Question {turn.ordinal} · {turn.question.difficulty}
+                </p>
+                <p className="mt-1 font-medium">{turn.question.text}</p>
+              </article>
+            ))}
             <ol className="grid gap-2 text-sm" aria-label="Session timeline">
               {timeline.map((event) => (
                 <li className="rounded-lg border border-[var(--border)] bg-white px-3 py-2" key={event.sequence}>

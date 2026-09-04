@@ -15,8 +15,8 @@ const encoder = new TextDecoder();
 function event(sequence: number): TimelineEvent {
   return {
     sequence,
-    type: `event_${sequence}`,
-    payload: { sequence },
+    type: "operation_started",
+    payload: { operation: "generate_plan" },
     createdAt: "2026-08-28T08:00:00.000Z",
   };
 }

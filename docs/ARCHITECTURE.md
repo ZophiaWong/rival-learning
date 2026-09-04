@@ -72,6 +72,7 @@ interface SessionEngine {
 
 ```ts
 type SessionCommand =
+  | { type: "create_session"; sessionId: string; profileId: string; interviewLanguage: "zh-CN" | "en-US"; idempotencyKey: string }
   | { type: "generate_plan"; sessionId: string; idempotencyKey: string }
   | { type: "start"; sessionId: string; idempotencyKey: string }
   | { type: "request_ai_answer"; sessionId: string; idempotencyKey: string }
@@ -91,6 +92,8 @@ type SessionCommand =
 ## InterviewAgents Module
 
 `InterviewAgents` 向 `SessionEngine` 暴露领域操作，而不是通用 chat primitive：
+
+- Step 2 的 Interface 只暴露 `planSingleAttackChain` 与 `generateNextQuestion`；后续步骤按 milestone 增加下面的领域操作，不暴露通用 chat 方法。
 
 - 生成结构化 InterviewPlan。
 - 生成下一问题。
@@ -135,6 +138,8 @@ production Adapter 为每个角色维护独立的 `OpenAI client → OpenAIProvi
 - immutable timeline：保存用户可见事件、模型 usage、operation outcome 和恢复所需事实。
 
 这不是完整 event sourcing；current state 是权威的运行快照，不要求从 timeline 重建所有内部状态。
+
+current state 使用版本化 Zod schema，并保存创建 `Session` 时的完整 core-loop policy snapshot。内部 state 经显式 `SessionView` 投影后才可公开；证据附近上下文、问题规范化 key、operation token、未展示候选和逐请求明细不进入公开投影。timeline event 同样使用共享的 Zod discriminated union 校验。
 
 外部模型调用期间不持有 SQLite transaction。一次可能调用 provider 的命令按以下协议运行：
 
