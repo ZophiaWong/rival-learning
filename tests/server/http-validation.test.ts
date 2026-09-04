@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { POST as createProfile } from "@/app/api/profiles/route";
 import { POST as runSessionAction } from "@/app/api/sessions/[id]/actions/route";
 import { POST as createSession } from "@/app/api/sessions/route";
+import { sessionActionRequestSchema } from "@/server/http";
 
 const localUrl = "http://127.0.0.1:3000";
 
@@ -91,6 +92,46 @@ describe("HTTP runtime validation", () => {
     );
 
     await expectInvalidRequest(response, ["type"]);
+  });
+
+  it("uses a strict discriminated action schema and Unicode answer limit", async () => {
+    for (const type of [
+      "generate_plan",
+      "start",
+      "request_ai_answer",
+      "request_next_question",
+      "take_over",
+    ]) {
+      expect(sessionActionRequestSchema.safeParse({ type }).success).toBe(true);
+    }
+    expect(
+      sessionActionRequestSchema.parse({
+        type: "submit_human_answer",
+        answer: ` ${"🙂".repeat(4_000)} `,
+      }),
+    ).toEqual({ type: "submit_human_answer", answer: "🙂".repeat(4_000) });
+    expect(
+      sessionActionRequestSchema.safeParse({
+        type: "submit_human_answer",
+        answer: "🙂".repeat(4_001),
+      }).success,
+    ).toBe(false);
+    expect(
+      sessionActionRequestSchema.safeParse({ type: "submit_human_answer" }).success,
+    ).toBe(false);
+    expect(
+      sessionActionRequestSchema.safeParse({ type: "take_over", answer: "unexpected" }).success,
+    ).toBe(false);
+
+    const response = await runSessionAction(
+      jsonRequest(
+        "/api/sessions/session-1/actions",
+        { type: "submit_human_answer", answer: "🙂".repeat(4_001) },
+        "action-2",
+      ),
+      { params: Promise.resolve({ id: "session-1" }) },
+    );
+    await expectInvalidRequest(response, ["answer"]);
   });
 
   it("validates PreparationProfile input before the domain Module", async () => {

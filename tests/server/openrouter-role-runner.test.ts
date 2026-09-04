@@ -172,6 +172,55 @@ function configuredEnvironment(secret: string) {
 }
 
 describe("OpenRouterRoleRunner", () => {
+  it("binds Candidate calls to the independent Candidate model and credential", async () => {
+    const mock = await startMockServer([{ body: completion({ answer: "candidate response" }) }]);
+    const clientOptions = vi.fn();
+    const config = parseServerConfig({
+      RIVAL_DATABASE_PATH: ".data/test.db",
+      RIVAL_HOST: "127.0.0.1",
+      RIVAL_INTERVIEWER_PROVIDER: "openrouter",
+      RIVAL_INTERVIEWER_MODEL: "test/interviewer-model",
+      RIVAL_INTERVIEWER_API_KEY: "sk-interviewer-canary",
+      RIVAL_CANDIDATE_PROVIDER: "openrouter",
+      RIVAL_CANDIDATE_MODEL: "test/candidate-model",
+      RIVAL_CANDIDATE_API_KEY: "sk-candidate-canary",
+    });
+    const runner = new OpenRouterRoleRunner(config, {
+      createClient(options) {
+        clientOptions(options);
+        return new OpenAI({ ...options, baseURL: mock.baseURL });
+      },
+    });
+
+    const result = await runner.runStructured({
+      role: "candidate",
+      operation: "generate_candidate_answer",
+      instructions: "Synthetic Candidate instructions",
+      input: "Synthetic bounded input",
+      outputSchema: z.object({ answer: z.string() }),
+    });
+
+    expect(result).toMatchObject({
+      status: "success",
+      attempts: [{ model: "test/candidate-model" }],
+    });
+    expect(clientOptions).toHaveBeenCalledWith({
+      apiKey: "sk-candidate-canary",
+      baseURL: "https://openrouter.ai/api/v1",
+      maxRetries: 0,
+    });
+    expect(mock.requests[0]).toMatchObject({
+      body: {
+        model: "test/candidate-model",
+        metadata: {
+          app: "rival-learning",
+          role: "candidate",
+          operation: "generate_candidate_answer",
+        },
+      },
+    });
+  });
+
   it("sends one structured Chat Completions request with fixed routing and privacy settings", async () => {
     const secret = "sk-test-production-canary";
     const mock = await startMockServer([{ body: completion({ answer: "hello" }) }]);

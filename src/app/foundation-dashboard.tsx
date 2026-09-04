@@ -10,6 +10,17 @@ import type {
 import type { SessionView, TimelineEvent } from "@/server/session-engine";
 import type { InterviewLanguage } from "@/server/core-loop/domain";
 
+type SessionAction =
+  | {
+      type:
+        | "generate_plan"
+        | "start"
+        | "request_ai_answer"
+        | "request_next_question"
+        | "take_over";
+    }
+  | { type: "submit_human_answer"; answer: string };
+
 const emptyInput: PreparationProfileInput = {
   name: "",
   resume: "",
@@ -41,6 +52,21 @@ async function requestJson<T>(
   return body;
 }
 
+function mergeTimelineEvents(
+  current: TimelineEvent[],
+  incoming: TimelineEvent[],
+): TimelineEvent[] {
+  const bySequence = new Map(current.map((event) => [event.sequence, event]));
+  for (const event of incoming) bySequence.set(event.sequence, event);
+  return [...bySequence.values()].sort((left, right) => left.sequence - right.sequence);
+}
+
+function writeSessionUrl(sessionId: string): void {
+  const url = new URL(window.location.href);
+  url.searchParams.set("session", sessionId);
+  window.history.replaceState(null, "", url);
+}
+
 export function FoundationDashboard() {
   const [profiles, setProfiles] = useState<PreparationProfile[]>([]);
   const [sessions, setSessions] = useState<SessionView[]>([]);
@@ -52,6 +78,9 @@ export function FoundationDashboard() {
   const [form, setForm] = useState<PreparationProfileInput>(emptyInput);
   const [message, setMessage] = useState("准备创建第一个 PreparationProfile。");
   const [busy, setBusy] = useState(true);
+  const [pendingOperation, setPendingOperation] = useState<SessionAction["type"] | null>(null);
+  const [takeOverConfirmationTurnId, setTakeOverConfirmationTurnId] = useState<string | null>(null);
+  const [humanAnswer, setHumanAnswer] = useState("");
   const initialLoad = useRef<
     Promise<[{ profiles: PreparationProfile[] }, { sessions: SessionView[] }]> | null
   >(null);
@@ -88,12 +117,22 @@ export function FoundationDashboard() {
     );
   }, []);
 
-  const loadSessionDetail = useCallback(async (sessionId: string) => {
+  const loadSessionDetail = useCallback(async (sessionId: string, updateUrl = true) => {
     const data = await requestJson<{ session: SessionView; timeline: TimelineEvent[] }>(
       `/api/sessions/${sessionId}`,
     );
+    setSessions((current) => {
+      const withoutSelected = current.filter((session) => session.id !== sessionId);
+      return [...withoutSelected, data.session].sort((left, right) =>
+        left.createdAt.localeCompare(right.createdAt),
+      );
+    });
     setSelectedSessionId(sessionId);
     setTimeline(data.timeline);
+    setTakeOverConfirmationTurnId(null);
+    setHumanAnswer("");
+    if (updateUrl) writeSessionUrl(sessionId);
+    return data;
   }, []);
 
   useEffect(() => {
@@ -106,12 +145,7 @@ export function FoundationDashboard() {
         if (!Number.isSafeInteger(nextEvent.sequence) || typeof nextEvent.type !== "string") {
           return;
         }
-        setTimeline((current) => {
-          if (current.some((event) => event.sequence === nextEvent.sequence)) {
-            return current;
-          }
-          return [...current, nextEvent].sort((left, right) => left.sequence - right.sequence);
-        });
+        setTimeline((current) => mergeTimelineEvents(current, [nextEvent]));
       } catch {
         // A malformed public event is ignored; reconnect or a detail refresh restores state.
       }
@@ -134,7 +168,24 @@ export function FoundationDashboard() {
         if (!cancelled) {
           setProfiles(profileData.profiles);
           setSessions(sessionData.sessions);
-          setBusy(false);
+          const requestedSessionId = new URL(window.location.href).searchParams.get("session");
+          if (requestedSessionId) {
+            void loadSessionDetail(requestedSessionId, false)
+              .catch((error: unknown) => {
+                if (!cancelled) {
+                  setMessage(
+                    `无法恢复 URL 中的 Session（${requestedSessionId}）：${
+                      error instanceof Error ? error.message : "加载失败"
+                    }。你仍可从历史列表选择其他 Session。`,
+                  );
+                }
+              })
+              .finally(() => {
+                if (!cancelled) setBusy(false);
+              });
+          } else {
+            setBusy(false);
+          }
         }
       })
       .catch((error: unknown) => {
@@ -146,7 +197,7 @@ export function FoundationDashboard() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadSessionDetail]);
 
   function updateField(field: keyof PreparationProfileInput, value: string) {
     setForm((current) => ({ ...current, [field]: value || (field === "repoPath" ? null : "") }));
@@ -276,12 +327,17 @@ export function FoundationDashboard() {
     }
   }
 
-  async function runSessionAction(type: "generate_plan" | "start") {
+  async function runSessionAction(action: SessionAction) {
     if (!selectedSessionId) return;
     setBusy(true);
+    setPendingOperation(action.type);
     try {
       const idempotencyKey = crypto.randomUUID();
-      await requestJson(
+      const result = await requestJson<{
+        status: "applied";
+        session: SessionView;
+        events: TimelineEvent[];
+      }>(
         `/api/sessions/${selectedSessionId}/actions`,
         {
           method: "POST",
@@ -289,20 +345,45 @@ export function FoundationDashboard() {
             "Content-Type": "application/json",
             "Idempotency-Key": idempotencyKey,
           },
-          body: JSON.stringify({ type }),
+          body: JSON.stringify(action),
         },
         1,
       );
-      await Promise.all([loadSessions(), loadSessionDetail(selectedSessionId)]);
-      setMessage(type === "generate_plan" ? "InterviewPlan 已生成。" : "Session 已启动并展示首题。");
+      setSessions((current) =>
+        current.map((session) =>
+          session.id === result.session.id ? result.session : session,
+        ),
+      );
+      setTimeline((current) => mergeTimelineEvents(current, result.events));
+      setTakeOverConfirmationTurnId(null);
+      setHumanAnswer("");
+      const successMessage: Record<SessionAction["type"], string> = {
+        generate_plan: "InterviewPlan 已生成。",
+        start: "Session 已启动并展示首题。",
+        request_ai_answer: "Candidate 回答已保存；由你决定何时继续追问。",
+        request_next_question: "下一问题已展示。",
+        take_over: "你已接管本链，余下问题均由你回答。",
+        submit_human_answer: result.session.state.execution?.status === "completed"
+          ? "回答已保存，本条 AttackChain 已完成。"
+          : "回答已保存；由你决定何时继续追问。",
+      };
+      setMessage(successMessage[action.type]);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Session action 失败");
+      try {
+        await loadSessionDetail(selectedSessionId, false);
+      } catch {
+        // Preserve the original action error; a later selection or refresh can reload state.
+      }
     } finally {
+      setPendingOperation(null);
       setBusy(false);
     }
   }
 
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
+  const visibleOperation = pendingOperation ?? selectedSession?.state.activeOperation ?? null;
+  const actionDisabled = busy || visibleOperation !== null;
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-5 py-10">
@@ -543,8 +624,8 @@ export function FoundationDashboard() {
             <div className="flex flex-wrap gap-2">
               <button
                 className="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
-                disabled={busy || selectedSession.status !== "draft"}
-                onClick={() => void runSessionAction("generate_plan")}
+                disabled={actionDisabled || selectedSession.status !== "draft"}
+                onClick={() => void runSessionAction({ type: "generate_plan" })}
                 type="button"
               >
                 生成 InterviewPlan
@@ -552,11 +633,11 @@ export function FoundationDashboard() {
               <button
                 className="rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
                 disabled={
-                  busy ||
+                  actionDisabled ||
                   selectedSession.status !== "planned" ||
                   selectedSession.state.plan?.attackChains[0].status !== "ready"
                 }
-                onClick={() => void runSessionAction("start")}
+                onClick={() => void runSessionAction({ type: "start" })}
                 type="button"
               >
                 启动 Session
@@ -588,14 +669,163 @@ export function FoundationDashboard() {
                 </ul>
               </div>
             ) : null}
-            {selectedSession.state.execution?.turns.map((turn) => (
-              <article className="rounded-lg border border-[var(--border)] bg-white p-3" key={turn.id}>
-                <p className="text-xs uppercase tracking-wide text-[var(--muted)]">
-                  Question {turn.ordinal} · {turn.question.difficulty}
-                </p>
-                <p className="mt-1 font-medium">{turn.question.text}</p>
-              </article>
-            ))}
+            {visibleOperation ? (
+              <p
+                className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                aria-label="Current Session operation"
+              >
+                当前 operation：{visibleOperation}
+              </p>
+            ) : null}
+            {selectedSession.state.failedOperation ? (
+              <div
+                className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-900"
+                role="alert"
+              >
+                <p>{selectedSession.state.failedOperation.userMessage}</p>
+                {selectedSession.state.failedOperation.type === "request_ai_answer" ? (
+                  <p className="mt-1">Candidate 生成失败；当前问题仍可由你 Take Over。</p>
+                ) : null}
+                {selectedSession.state.failedOperation.type === "request_next_question" ? (
+                  <p className="mt-1">
+                    本版本不能恢复失败的追问 operation。请从已确认的 Profile 新建 Session。
+                  </p>
+                ) : null}
+              </div>
+            ) : null}
+            {selectedSession.state.execution?.turns.map((turn, index, turns) => {
+              const execution = selectedSession.state.execution!;
+              const isCurrentTurn = index === turns.length - 1;
+              const isPending = isCurrentTurn && turn.status === "awaiting_answer";
+              const candidateFailureCanBeTakenOver =
+                selectedSession.status === "error" &&
+                selectedSession.state.failedOperation?.type === "request_ai_answer";
+              const takeOverAvailable =
+                isPending &&
+                execution.answerMode === "a2a" &&
+                (selectedSession.status === "active" || candidateFailureCanBeTakenOver);
+              return (
+                <article
+                  className="rounded-xl border border-[var(--border)] bg-white p-4"
+                  key={turn.id}
+                >
+                  <p className="text-xs uppercase tracking-wide text-[var(--muted)]">
+                    Question {turn.ordinal} · {turn.question.difficulty}
+                  </p>
+                  <p className="mt-1 font-medium">{turn.question.text}</p>
+                  {turn.answer ? (
+                    <div className="mt-3 rounded-lg bg-slate-50 p-3">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+                        {turn.answer.actor === "candidate" ? "Candidate" : "你的回答"}
+                      </p>
+                      <p className="mt-1 whitespace-pre-wrap">{turn.answer.text}</p>
+                    </div>
+                  ) : null}
+                  {isPending && execution.answerMode === "a2a" ? (
+                    <div className="mt-4 grid gap-3">
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          className="rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                          disabled={
+                            actionDisabled ||
+                            selectedSession.status !== "active" ||
+                            Boolean(selectedSession.state.failedOperation)
+                          }
+                          onClick={() =>
+                            void runSessionAction({ type: "request_ai_answer" })
+                          }
+                          type="button"
+                        >
+                          Candidate 回答
+                        </button>
+                        <button
+                          className="rounded-lg border border-[var(--accent)] px-3 py-2 text-sm font-semibold text-[var(--accent)] disabled:opacity-40"
+                          disabled={actionDisabled || !takeOverAvailable}
+                          onClick={() => setTakeOverConfirmationTurnId(turn.id)}
+                          type="button"
+                        >
+                          Take Over
+                        </button>
+                      </div>
+                      {takeOverConfirmationTurnId === turn.id ? (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm">
+                          <p>确认后，本链余下所有问题都由你回答，控制权不会自动切回 Candidate。</p>
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                              className="rounded-md bg-slate-900 px-3 py-2 font-semibold text-white disabled:opacity-40"
+                              disabled={actionDisabled}
+                              onClick={() => void runSessionAction({ type: "take_over" })}
+                              type="button"
+                            >
+                              确认 Take Over
+                            </button>
+                            <button
+                              className="rounded-md border border-[var(--border)] px-3 py-2"
+                              disabled={actionDisabled}
+                              onClick={() => setTakeOverConfirmationTurnId(null)}
+                              type="button"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {isPending && execution.answerMode === "a2h" ? (
+                    <div className="mt-4 grid gap-2">
+                      <label className="grid gap-1 text-sm font-medium">
+                        你的回答（Question {turn.ordinal}）
+                        <textarea
+                          className="min-h-28 rounded-lg border border-[var(--border)] px-3 py-2"
+                          disabled={actionDisabled}
+                          onChange={(event) => setHumanAnswer(event.target.value)}
+                          value={humanAnswer}
+                        />
+                      </label>
+                      <p className="text-xs text-[var(--muted)]">
+                        {Array.from(humanAnswer).length}/4000 Unicode 字符；草稿不会持久化。
+                      </p>
+                      <button
+                        className="justify-self-start rounded-lg bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                        disabled={
+                          actionDisabled ||
+                          !humanAnswer.trim() ||
+                          Array.from(humanAnswer.trim()).length > 4_000
+                        }
+                        onClick={() =>
+                          void runSessionAction({
+                            type: "submit_human_answer",
+                            answer: humanAnswer,
+                          })
+                        }
+                        type="button"
+                      >
+                        提交回答
+                      </button>
+                    </div>
+                  ) : null}
+                  {isCurrentTurn && execution.status === "ready_for_next_question" ? (
+                    <button
+                      className="mt-4 rounded-lg bg-slate-900 px-3 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                      disabled={actionDisabled || selectedSession.status !== "active"}
+                      onClick={() =>
+                        void runSessionAction({ type: "request_next_question" })
+                      }
+                      type="button"
+                    >
+                      继续追问
+                    </button>
+                  ) : null}
+                </article>
+              );
+            })}
+            {selectedSession.state.execution?.status === "completed" ? (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
+                <p className="font-semibold">本条 AttackChain 已完成，transcript 现为只读。</p>
+                <p className="mt-1">Checkpoint 将在 Step 4 提供。</p>
+              </div>
+            ) : null}
             <ol className="grid gap-2 text-sm" aria-label="Session timeline">
               {timeline.map((event) => (
                 <li className="rounded-lg border border-[var(--border)] bg-white px-3 py-2" key={event.sequence}>

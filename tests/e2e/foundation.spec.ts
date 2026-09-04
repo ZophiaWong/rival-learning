@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test.setTimeout(60_000);
 
-test("Profile confirmation, Session snapshot, reuse, duplicate, and retained history", async ({
+test("A2A Take Over path, refresh recovery, Profile reuse, and retained history", async ({
   page,
 }) => {
   let sessionCreateRequest:
@@ -85,6 +85,41 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
     page.getByLabel("Session timeline").locator("li").filter({ hasText: "session_started" }),
   ).toHaveCount(1);
 
+  await page.getByRole("button", { name: "Candidate 回答", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Candidate 回答已保存");
+  await expect(page.getByText(/我亲自负责迁移范围与回滚决策/)).toBeVisible();
+  await page.getByRole("button", { name: "继续追问", exact: true }).click();
+  await expect(page.getByText("你为什么选择幂等重试，而不是依赖一次性投递或人工补偿？")).toBeVisible();
+
+  await page.getByRole("button", { name: "Take Over", exact: true }).click();
+  await expect(page.getByText(/本链余下所有问题都由你回答/)).toBeVisible();
+  await page.getByRole("button", { name: "确认 Take Over", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("余下问题均由你回答");
+  await page
+    .getByLabel("你的回答（Question 2）")
+    .fill("我会比较重复处理风险、恢复时间和人工补偿成本，再用压测数据验证选择。");
+  await page.getByRole("button", { name: "提交回答", exact: true }).click();
+  await page.getByRole("button", { name: "继续追问", exact: true }).click();
+  await expect(page.getByText("如果迁移指标开始恶化，你会依据哪些信号触发回滚？")).toBeVisible();
+  await page
+    .getByLabel("你的回答（Question 3）")
+    .fill("如果重复率或尾延迟持续越过阈值，我会停止扩量并按预案回滚。");
+  await page.getByRole("button", { name: "提交回答", exact: true }).click();
+  await expect(page.getByText("本条 AttackChain 已完成，transcript 现为只读。")).toBeVisible();
+  await expect(page.getByText("Checkpoint 将在 Step 4 提供。")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Candidate 回答", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "继续追问", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Auto", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Hand Back", exact: true })).toHaveCount(0);
+
+  const sessionTimeline = page.getByLabel("Session timeline");
+  await expect(sessionTimeline.locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
+  await expect(sessionTimeline.locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);
+  await expect(sessionTimeline.locator("li").filter({ hasText: "control_taken_over" })).toHaveCount(1);
+  expect(new URL(page.url()).searchParams.get("session")).toBe(
+    sessionCreateRequest?.body.sessionId,
+  );
+
   await page
     .getByLabel("Resume")
     .fill("Email: candidate@example.com\nBuilt the revised queue consumer and reduced failures by 40%.");
@@ -112,5 +147,15 @@ test("Profile confirmation, Session snapshot, reuse, duplicate, and retained his
 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Session history" })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Backend preparation.*active/ })).toBeVisible();
+  await expect(page.getByText("本条 AttackChain 已完成，transcript 现为只读。")).toBeVisible();
+  await expect(page.getByText(/我亲自负责迁移范围与回滚决策/)).toBeVisible();
+  await expect(page.getByText(/我会比较重复处理风险/)).toBeVisible();
+  await expect(page.getByText(/如果重复率或尾延迟持续越过阈值/)).toBeVisible();
+  await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
+  await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);
+
+  await page.goto("/?session=missing-session");
+  await expect(page.getByRole("status")).toContainText("无法恢复 URL 中的 Session");
   await expect(page.getByRole("button", { name: /Backend preparation.*active/ })).toBeVisible();
 });

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { CORE_LOOP_V1_POLICY } from "./policy";
+import { CORE_LOOP_V2_POLICY } from "./policy";
 
 export const interviewLanguageSchema = z.enum(["zh-CN", "en-US"]);
 export type InterviewLanguage = z.infer<typeof interviewLanguageSchema>;
@@ -29,7 +29,7 @@ function boundedUserText(maximum: number) {
 
 export const difficultyBasisSchema = z.strictObject({
   signals: z.array(difficultySignalSchema).min(1).max(5),
-  explanation: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.difficultyExplanation),
+  explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.difficultyExplanation),
 });
 export type DifficultyBasis = z.infer<typeof difficultyBasisSchema>;
 
@@ -58,21 +58,21 @@ export const requestedEvidenceKindSchema = z.enum([
 
 export const requestedEvidenceSchema = z.strictObject({
   kind: requestedEvidenceKindSchema,
-  prompt: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.requestedEvidencePrompt),
+  prompt: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.requestedEvidencePrompt),
 });
 export type RequestedEvidence = z.infer<typeof requestedEvidenceSchema>;
 
 export const readyAttackChainCandidateSchema = z.strictObject({
   status: z.literal("ready"),
   intent: z.literal("ownership_claim_depth"),
-  knowledgeTarget: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.knowledgeTarget),
+  knowledgeTarget: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.knowledgeTarget),
   evidenceAnchors: z
     .array(rawEvidenceAnchorSchema)
     .min(1)
-    .max(CORE_LOOP_V1_POLICY.maxEvidenceAnchors),
+    .max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
   initialDifficulty: difficultySchema,
   difficultyBasis: difficultyBasisSchema,
-  estimatedDepth: z.number().int().min(1).max(CORE_LOOP_V1_POLICY.maxQuestionTurns),
+  estimatedDepth: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
 });
 
 export const needsInputAttackChainCandidateSchema = z.strictObject({
@@ -82,7 +82,7 @@ export const needsInputAttackChainCandidateSchema = z.strictObject({
   requestedEvidence: z
     .array(requestedEvidenceSchema)
     .min(1)
-    .max(CORE_LOOP_V1_POLICY.maxRequestedEvidenceItems),
+    .max(CORE_LOOP_V2_POLICY.maxRequestedEvidenceItems),
 });
 
 export const attackChainCandidateSchema = z.discriminatedUnion("status", [
@@ -98,7 +98,7 @@ export const readyAttackChainSchema = readyAttackChainCandidateSchema.omit({
   evidenceAnchors: z
     .array(evidenceAnchorSchema)
     .min(1)
-    .max(CORE_LOOP_V1_POLICY.maxEvidenceAnchors),
+    .max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
 });
 
 export const needsInputAttackChainSchema = needsInputAttackChainCandidateSchema.extend({
@@ -129,12 +129,21 @@ export const generationUsageSchema = z.strictObject({
 export type GenerationUsage = z.infer<typeof generationUsageSchema>;
 
 export const generationMetadataSchema = z.strictObject({
-  contractVersion: z.enum(["interview-plan-v1", "interviewer-question-v1"]),
+  contractVersion: z.enum([
+    "interview-plan-v1",
+    "interviewer-question-v1",
+    "candidate-answer-v1",
+  ]),
   provider: z.string().min(1).nullable(),
   model: z.string().min(1).nullable(),
   usage: generationUsageSchema,
 });
 export type GenerationMetadata = z.infer<typeof generationMetadataSchema>;
+
+export const candidateAnswerGenerationMetadataSchema = generationMetadataSchema.refine(
+  (generation) => generation.contractVersion === "candidate-answer-v1",
+  { message: "Candidate answers require candidate-answer-v1 generation metadata" },
+);
 
 export const contextLineSchema = z.strictObject({
   source: evidenceSourceSchema,
@@ -145,8 +154,8 @@ export const contextLineSchema = z.strictObject({
 
 export const questionContextPacketSchema = z.strictObject({
   lines: z.array(contextLineSchema).min(1),
-  totalLines: z.number().int().min(1).max(CORE_LOOP_V1_POLICY.maxQuestionContextLines),
-  totalCharacters: z.number().int().min(0).max(CORE_LOOP_V1_POLICY.maxQuestionContextChars),
+  totalLines: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionContextLines),
+  totalCharacters: z.number().int().min(0).max(CORE_LOOP_V2_POLICY.maxQuestionContextChars),
 });
 export type QuestionContextPacket = z.infer<typeof questionContextPacketSchema>;
 
@@ -158,9 +167,9 @@ export const interviewPlanRecordSchema = z.strictObject({
 export type InterviewPlanRecord = z.infer<typeof interviewPlanRecordSchema>;
 
 export const proposedQuestionSchema = z.strictObject({
-  text: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.question),
+  text: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.question),
   difficulty: difficultySchema,
-  evidenceAnchorIds: z.array(z.string().min(1)).min(1).max(CORE_LOOP_V1_POLICY.maxEvidenceAnchors),
+  evidenceAnchorIds: z.array(z.string().min(1)).min(1).max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
 });
 export type ProposedQuestion = z.infer<typeof proposedQuestionSchema>;
 
@@ -169,22 +178,39 @@ export const nextQuestionCandidateSchema = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("complete"),
     code: z.enum(["knowledge_target_satisfied", "no_grounded_followup"]),
-    explanation: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.completionExplanation),
+    explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.completionExplanation),
   }),
 ]);
 export type NextQuestionCandidate = z.infer<typeof nextQuestionCandidateSchema>;
 
+export const answerTextSchema = boundedUserText(CORE_LOOP_V2_POLICY.textLimits.answer);
+
+export const candidateAnswerSchema = z.strictObject({
+  text: answerTextSchema,
+});
+export type CandidateAnswer = z.infer<typeof candidateAnswerSchema>;
+
+const recordedAnswerSchema = z.discriminatedUnion("actor", [
+  z.strictObject({
+    actor: z.literal("candidate"),
+    text: answerTextSchema,
+    generation: candidateAnswerGenerationMetadataSchema,
+  }),
+  z.strictObject({ actor: z.literal("human"), text: answerTextSchema }),
+]);
+
+export const answerModeSchema = z.enum(["a2a", "a2h"]);
+export type AnswerMode = z.infer<typeof answerModeSchema>;
+
 export const questionTurnSchema = z.strictObject({
   id: z.string().min(1),
-  ordinal: z.number().int().min(1).max(CORE_LOOP_V1_POLICY.maxQuestionTurns),
+  ordinal: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
   status: z.enum(["awaiting_answer", "settled"]),
   question: proposedQuestionSchema,
   normalizationKey: z.string().min(1),
   createdAt: z.iso.datetime(),
   settledAt: z.iso.datetime().nullable(),
-  answer: z
-    .strictObject({ actor: z.enum(["candidate", "human"]), text: z.string().min(1) })
-    .nullable(),
+  answer: recordedAnswerSchema.nullable(),
   generation: generationMetadataSchema,
 });
 export type QuestionTurn = z.infer<typeof questionTurnSchema>;
@@ -195,22 +221,28 @@ export const attackChainCompletionSchema = z.strictObject({
     "knowledge_target_satisfied",
     "no_grounded_followup",
   ]),
-  explanation: boundedUserText(CORE_LOOP_V1_POLICY.textLimits.completionExplanation),
+  explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.completionExplanation),
   completedAt: z.iso.datetime(),
 });
 export type AttackChainCompletion = z.infer<typeof attackChainCompletionSchema>;
 
 export const attackChainExecutionStateSchema = z.strictObject({
   chainId: z.string().min(1),
+  answerMode: answerModeSchema,
   status: z.enum(["awaiting_answer", "ready_for_next_question", "completed"]),
-  turns: z.array(questionTurnSchema).max(CORE_LOOP_V1_POLICY.maxQuestionTurns),
-  normalizedQuestionKeys: z.array(z.string().min(1)).max(CORE_LOOP_V1_POLICY.maxQuestionTurns),
+  turns: z.array(questionTurnSchema).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
+  normalizedQuestionKeys: z.array(z.string().min(1)).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
   completion: attackChainCompletionSchema.nullable(),
 });
 export type AttackChainExecutionState = z.infer<typeof attackChainExecutionStateSchema>;
 
-export const publicQuestionTurnSchema = questionTurnSchema.omit({
-  normalizationKey: true,
-  generation: true,
-}).strip();
+const publicRecordedAnswerSchema = z.object({
+  actor: z.enum(["candidate", "human"]),
+  text: answerTextSchema,
+});
+
+export const publicQuestionTurnSchema = questionTurnSchema
+  .omit({ normalizationKey: true, generation: true })
+  .extend({ answer: publicRecordedAnswerSchema.nullable() })
+  .strip();
 export type PublicQuestionTurn = z.infer<typeof publicQuestionTurnSchema>;
