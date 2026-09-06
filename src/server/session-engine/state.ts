@@ -2,10 +2,14 @@ import { z } from "zod";
 
 import {
   attackChainExecutionStateSchema,
+  benchmarkBatchSchema,
+  checkpointSchema,
   generationMetadataSchema,
   interviewLanguageSchema,
   interviewPlanRecordSchema,
   publicQuestionTurnSchema,
+  turnEvaluationSchema,
+  type Checkpoint,
 } from "@/server/core-loop/domain";
 import { coreLoopPolicySchema } from "@/server/core-loop/policy";
 
@@ -17,12 +21,21 @@ export const sessionOperationSchema = z.enum([
   "start",
   "request_ai_answer",
   "request_next_question",
+  "generate_checkpoint",
 ]);
 export type SessionOperation = z.infer<typeof sessionOperationSchema>;
+
+export const checkpointStageSchema = z.enum([
+  "evaluating",
+  "benchmarking",
+  "synthesizing",
+]);
+export type CheckpointStage = z.infer<typeof checkpointStageSchema>;
 
 export const activeOperationSchema = z.strictObject({
   type: sessionOperationSchema,
   token: z.string().min(1),
+  idempotencyKey: z.string().min(1).max(128),
   priorPhase: sessionPhaseSchema.exclude(["error"]),
   startedAt: z.iso.datetime(),
 });
@@ -37,36 +50,145 @@ export const failedOperationSchema = z.strictObject({
   rejectionCounts: z.record(z.string(), z.number().int().min(1)),
   lastRejectionReason: z.string().min(1).nullable(),
   generation: generationMetadataSchema,
+  stage: checkpointStageSchema.nullable().default(null),
 });
 export type FailedOperation = z.infer<typeof failedOperationSchema>;
 
-export const sessionStateV3Schema = z.strictObject({
-  stateVersion: z.literal(3),
+export const checkpointWorkStateSchema = z
+  .strictObject({
+    status: z.enum(["evaluating", "benchmarking", "synthesizing", "completed"]),
+    chainId: z.string().min(1),
+    humanTurnIds: z.array(z.string().min(1)).min(1).max(4),
+    evaluations: z.array(turnEvaluationSchema).max(4),
+    benchmarkBatch: benchmarkBatchSchema.nullable(),
+    result: checkpointSchema.nullable(),
+    startedAt: z.iso.datetime(),
+  })
+  .superRefine((checkpoint, context) => {
+    const evaluationTurnIds = checkpoint.evaluations.map((evaluation) => evaluation.turnId);
+    const expectedEvaluationTurnIds = checkpoint.humanTurnIds.slice(
+      0,
+      checkpoint.evaluations.length,
+    );
+    const evaluationsComplete =
+      checkpoint.evaluations.length === checkpoint.humanTurnIds.length;
+    if (
+      new Set(checkpoint.humanTurnIds).size !== checkpoint.humanTurnIds.length ||
+      evaluationTurnIds.some(
+        (turnId, index) => turnId !== expectedEvaluationTurnIds[index],
+      )
+    ) {
+      context.addIssue({ code: "custom", message: "Checkpoint turn order must remain stable" });
+    }
+    if (
+      checkpoint.status === "evaluating" &&
+      (evaluationsComplete || checkpoint.benchmarkBatch !== null || checkpoint.result !== null)
+    ) {
+      context.addIssue({ code: "custom", message: "Evaluation stage must remain incomplete" });
+    }
+    if (
+      checkpoint.status === "benchmarking" &&
+      (!evaluationsComplete || checkpoint.benchmarkBatch !== null || checkpoint.result !== null)
+    ) {
+      context.addIssue({ code: "custom", message: "Benchmark stage requires all evaluations" });
+    }
+    if (
+      checkpoint.status === "synthesizing" &&
+      (!evaluationsComplete || checkpoint.benchmarkBatch === null || checkpoint.result !== null)
+    ) {
+      context.addIssue({ code: "custom", message: "Synthesis stage requires frozen artifacts" });
+    }
+    if (
+      checkpoint.benchmarkBatch &&
+      (checkpoint.benchmarkBatch.benchmarks.length !== checkpoint.humanTurnIds.length ||
+        checkpoint.benchmarkBatch.benchmarks.some(
+          (benchmark, index) => benchmark.turnId !== checkpoint.humanTurnIds[index],
+        ))
+    ) {
+      context.addIssue({ code: "custom", message: "Benchmark turn order must remain stable" });
+    }
+    if (
+      checkpoint.status === "completed" &&
+      (!evaluationsComplete || checkpoint.benchmarkBatch === null || checkpoint.result === null)
+    ) {
+      context.addIssue({ code: "custom", message: "Completed Checkpoint requires every artifact" });
+    }
+    if (
+      checkpoint.result &&
+      (checkpoint.result.chainId !== checkpoint.chainId ||
+        checkpoint.result.evaluations.length !== checkpoint.humanTurnIds.length ||
+        checkpoint.result.evaluations.some(
+          (evaluation, index) => evaluation.turnId !== checkpoint.humanTurnIds[index],
+        ) ||
+        checkpoint.result.benchmarkBatch.benchmarks.length !== checkpoint.humanTurnIds.length ||
+        checkpoint.result.benchmarkBatch.benchmarks.some(
+          (benchmark, index) => benchmark.turnId !== checkpoint.humanTurnIds[index],
+        ))
+    ) {
+      context.addIssue({ code: "custom", message: "Completed Checkpoint must match frozen work" });
+    }
+  });
+export type CheckpointWorkState = z.infer<typeof checkpointWorkStateSchema>;
+
+export const sessionStateV4Schema = z.strictObject({
+  stateVersion: z.literal(4),
   phase: sessionPhaseSchema,
   interviewLanguage: interviewLanguageSchema,
   policy: coreLoopPolicySchema,
   planRecord: interviewPlanRecordSchema.nullable(),
   execution: attackChainExecutionStateSchema.nullable(),
+  checkpoint: checkpointWorkStateSchema.nullable(),
   activeOperation: activeOperationSchema.nullable(),
   failedOperation: failedOperationSchema.nullable(),
 });
-export type SessionStateV3 = z.infer<typeof sessionStateV3Schema>;
+export type SessionStateV4 = z.infer<typeof sessionStateV4Schema>;
+
+const publicTurnEvaluationSchema = turnEvaluationSchema.omit({ generation: true });
+const publicBenchmarkBatchSchema = benchmarkBatchSchema.omit({ generation: true });
+export const publicCheckpointSchema = checkpointSchema
+  .omit({ evaluations: true, benchmarkBatch: true, generation: true })
+  .extend({
+    evaluations: z.array(publicTurnEvaluationSchema).min(1).max(4),
+    benchmarkBatch: publicBenchmarkBatchSchema,
+  });
+export type PublicCheckpoint = z.infer<typeof publicCheckpointSchema>;
+
+export function projectCheckpoint(checkpoint: Checkpoint): PublicCheckpoint {
+  return publicCheckpointSchema.parse({
+    status: checkpoint.status,
+    chainId: checkpoint.chainId,
+    comparisons: checkpoint.comparisons,
+    findings: checkpoint.findings,
+    completedAt: checkpoint.completedAt,
+    evaluations: checkpoint.evaluations.map((evaluation) => ({
+      turnId: evaluation.turnId,
+      rubricVersion: evaluation.rubricVersion,
+      dimensions: evaluation.dimensions,
+      createdAt: evaluation.createdAt,
+    })),
+    benchmarkBatch: {
+      benchmarks: checkpoint.benchmarkBatch.benchmarks,
+      createdAt: checkpoint.benchmarkBatch.createdAt,
+    },
+  });
+}
 
 export interface PublicSessionState {
-  interviewLanguage: SessionStateV3["interviewLanguage"];
-  plan: NonNullable<SessionStateV3["planRecord"]>["plan"] | null;
+  interviewLanguage: SessionStateV4["interviewLanguage"];
+  plan: NonNullable<SessionStateV4["planRecord"]>["plan"] | null;
   execution: {
     chainId: string;
-    answerMode: NonNullable<SessionStateV3["execution"]>["answerMode"];
-    status: NonNullable<SessionStateV3["execution"]>["status"];
+    answerMode: NonNullable<SessionStateV4["execution"]>["answerMode"];
+    status: NonNullable<SessionStateV4["execution"]>["status"];
     turns: Array<z.infer<typeof publicQuestionTurnSchema>>;
-    completion: NonNullable<SessionStateV3["execution"]>["completion"];
+    completion: NonNullable<SessionStateV4["execution"]>["completion"];
   } | null;
+  checkpoint: PublicCheckpoint | null;
   activeOperation: SessionOperation | null;
   failedOperation: Omit<FailedOperation, "operationToken" | "generation"> | null;
 }
 
-export function projectSessionState(state: SessionStateV3): PublicSessionState {
+export function projectSessionState(state: SessionStateV4): PublicSessionState {
   return {
     interviewLanguage: state.interviewLanguage,
     plan: state.planRecord?.plan ?? null,
@@ -79,6 +201,10 @@ export function projectSessionState(state: SessionStateV3): PublicSessionState {
           completion: state.execution.completion,
         }
       : null,
+    checkpoint:
+      state.checkpoint?.status === "completed" && state.checkpoint.result
+        ? projectCheckpoint(state.checkpoint.result)
+        : null,
     activeOperation: state.activeOperation?.type ?? null,
     failedOperation: state.failedOperation
       ? {
@@ -89,6 +215,7 @@ export function projectSessionState(state: SessionStateV3): PublicSessionState {
           retrySafety: state.failedOperation.retrySafety,
           rejectionCounts: state.failedOperation.rejectionCounts,
           lastRejectionReason: state.failedOperation.lastRejectionReason,
+          stage: state.failedOperation.stage,
         }
       : null,
   };

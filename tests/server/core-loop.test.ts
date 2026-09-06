@@ -20,7 +20,7 @@ import {
   measurePlanningInput,
 } from "@/server/core-loop/grounding";
 import {
-  CORE_LOOP_V2_POLICY,
+  CORE_LOOP_V3_POLICY,
   coreLoopPolicySchema,
   createCoreLoopPolicySnapshot,
 } from "@/server/core-loop/policy";
@@ -76,22 +76,32 @@ function materialize(overrides: Record<string, unknown> = {}) {
   });
 }
 
-describe("core-loop v2 policy and schemas", () => {
+describe("core-loop v3 policy and schemas", () => {
   it("keeps every core-loop limit and contract in one parsed immutable snapshot", () => {
-    expect(coreLoopPolicySchema.parse(CORE_LOOP_V2_POLICY)).toMatchObject({
-      version: "core-loop-v2",
+    expect(coreLoopPolicySchema.parse(CORE_LOOP_V3_POLICY)).toMatchObject({
+      version: "core-loop-v3",
       candidateAnswerContractVersion: "candidate-answer-v1",
+      rubricVersion: "answer-rubric-v1",
+      judgeEvaluationContractVersion: "judge-turn-evaluation-v1",
+      benchmarkContractVersion: "candidate-benchmark-v1",
+      checkpointContractVersion: "judge-checkpoint-v1",
       maxQuestionTurns: 4,
       maxEvidenceAnchors: 3,
       maxSemanticCandidatesPerOperation: 3,
       maxQuestionContextLines: 24,
       maxQuestionContextChars: 4_000,
       maxPlanningInputChars: 24_000,
-      textLimits: { answer: 4_000 },
+      textLimits: {
+        answer: 4_000,
+        benchmark: 4_000,
+        checkpointRationale: 600,
+        findingSummary: 240,
+        evidenceExcerpt: 400,
+      },
       questionNormalizerVersion: "question-v1",
     });
-    expect(Object.isFrozen(CORE_LOOP_V2_POLICY)).toBe(true);
-    expect(Object.isFrozen(CORE_LOOP_V2_POLICY.textLimits)).toBe(true);
+    expect(Object.isFrozen(CORE_LOOP_V3_POLICY)).toBe(true);
+    expect(Object.isFrozen(CORE_LOOP_V3_POLICY.textLimits)).toBe(true);
   });
 
   it("accepts only the two interview languages and rejects mixed union variants", () => {

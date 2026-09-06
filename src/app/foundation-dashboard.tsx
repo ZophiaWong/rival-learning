@@ -17,6 +17,7 @@ type SessionAction =
         | "start"
         | "request_ai_answer"
         | "request_next_question"
+        | "generate_checkpoint"
         | "take_over";
     }
   | { type: "submit_human_answer"; answer: string };
@@ -362,6 +363,7 @@ export function FoundationDashboard() {
         start: "Session 已启动并展示首题。",
         request_ai_answer: "Candidate 回答已保存；由你决定何时继续追问。",
         request_next_question: "下一问题已展示。",
+        generate_checkpoint: "Checkpoint 已生成。",
         take_over: "你已接管本链，余下问题均由你回答。",
         submit_human_answer: result.session.state.execution?.status === "completed"
           ? "回答已保存，本条 AttackChain 已完成。"
@@ -384,6 +386,10 @@ export function FoundationDashboard() {
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const visibleOperation = pendingOperation ?? selectedSession?.state.activeOperation ?? null;
   const actionDisabled = busy || visibleOperation !== null;
+  const humanTurnCount =
+    selectedSession?.state.execution?.turns.filter(
+      (turn) => turn.answer?.actor === "human",
+    ).length ?? 0;
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-5 py-10">
@@ -691,6 +697,16 @@ export function FoundationDashboard() {
                     本版本不能恢复失败的追问 operation。请从已确认的 Profile 新建 Session。
                   </p>
                 ) : null}
+                {selectedSession.state.failedOperation.type === "generate_checkpoint" ? (
+                  <p className="mt-1">
+                    Checkpoint 在
+                    {selectedSession.state.failedOperation.stage
+                      ? ` ${selectedSession.state.failedOperation.stage} `
+                      : "未知"}
+                    阶段失败；本版本不公开半成品，也不能恢复。请从已确认的 Profile 新建
+                    Session。
+                  </p>
+                ) : null}
               </div>
             ) : null}
             {selectedSession.state.execution?.turns.map((turn, index, turns) => {
@@ -821,10 +837,146 @@ export function FoundationDashboard() {
               );
             })}
             {selectedSession.state.execution?.status === "completed" ? (
-              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
+              <div className="grid gap-3 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-950">
                 <p className="font-semibold">本条 AttackChain 已完成，transcript 现为只读。</p>
-                <p className="mt-1">Checkpoint 将在 Step 4 提供。</p>
+                {!selectedSession.state.checkpoint && humanTurnCount > 0 ? (
+                  <div>
+                    <p>Checkpoint 会先独立评价你的回答，再生成 Benchmark 和差异综合。</p>
+                    <button
+                      className="mt-3 rounded-lg bg-[var(--accent)] px-3 py-2 font-semibold text-white disabled:opacity-40"
+                      disabled={actionDisabled || selectedSession.status !== "active"}
+                      onClick={() =>
+                        void runSessionAction({ type: "generate_checkpoint" })
+                      }
+                      type="button"
+                    >
+                      生成 Checkpoint
+                    </button>
+                  </div>
+                ) : null}
+                {!selectedSession.state.checkpoint && humanTurnCount === 0 ? (
+                  <p>本条链全部由 Candidate 回答；Step 4 不提供观察型 Checkpoint。</p>
+                ) : null}
               </div>
+            ) : null}
+            {selectedSession.state.checkpoint ? (
+              <section
+                aria-label="Checkpoint"
+                className="grid gap-4 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-slate-950"
+              >
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-indigo-700">
+                    Rubric-first Checkpoint
+                  </p>
+                  <h2 className="mt-1 text-xl font-semibold">回答差异与 GapFinding</h2>
+                  <p className="mt-1 text-slate-600">
+                    默认先看差异；Benchmark 与完整五维 Rubric 可按题展开。
+                  </p>
+                </div>
+                {selectedSession.state.checkpoint.evaluations.map((evaluation) => {
+                  const turn = selectedSession.state.execution?.turns.find(
+                    (item) => item.id === evaluation.turnId,
+                  );
+                  const comparison = selectedSession.state.checkpoint?.comparisons.find(
+                    (item) => item.turnId === evaluation.turnId,
+                  );
+                  const benchmark = selectedSession.state.checkpoint?.benchmarkBatch.benchmarks.find(
+                    (item) => item.turnId === evaluation.turnId,
+                  );
+                  const findings = selectedSession.state.checkpoint?.findings.filter(
+                    (finding) => finding.sourceTurnIds[0] === evaluation.turnId,
+                  ) ?? [];
+                  if (!turn || !benchmark || !comparison) return null;
+                  return (
+                    <article
+                      className="grid gap-3 rounded-xl border border-indigo-100 bg-white p-4"
+                      key={evaluation.turnId}
+                    >
+                      <div>
+                        <h3 className="font-semibold">Question {turn.ordinal} Checkpoint</h3>
+                        <p className="mt-1">{turn.question.text}</p>
+                      </div>
+                      {comparison.differences.length === 0 ? (
+                        <p className="rounded-lg bg-emerald-50 p-3 text-emerald-900">
+                          本题五维 Rubric 均无 partial/missing 差异。
+                        </p>
+                      ) : (
+                        <div className="grid gap-2">
+                          {comparison.differences.map((difference) => (
+                            <div
+                              className="rounded-lg border border-amber-200 bg-amber-50 p-3"
+                              key={difference.dimension}
+                            >
+                              <p className="font-semibold">差异：{difference.dimension}</p>
+                              <p className="mt-1">{difference.explanation}</p>
+                              <p className="mt-2 text-xs text-slate-700">
+                                你的原回答摘录：{difference.answerExcerpt ?? "（无适用摘录）"}
+                              </p>
+                              <p className="mt-1 text-xs text-slate-700">
+                                Benchmark 摘录：{difference.benchmarkExcerpt}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      {findings.map((finding) => (
+                        <div
+                          className="rounded-lg border border-fuchsia-200 bg-fuchsia-50 p-3"
+                          key={finding.id}
+                        >
+                          <p className="font-semibold">
+                            Priority {finding.priority} · {finding.targetDimension} · {finding.calibration}
+                          </p>
+                          <p className="mt-1">{finding.summary}</p>
+                          <p className="mt-1 text-xs text-slate-700">依据：{finding.basis}</p>
+                          <p className="mt-1 text-xs text-slate-700">
+                            来源问题：
+                            {finding.sourceTurnIds
+                              .map((turnId) =>
+                                selectedSession.state.execution?.turns.find(
+                                  (item) => item.id === turnId,
+                                )?.ordinal,
+                              )
+                              .filter((ordinal) => ordinal !== undefined)
+                              .map((ordinal) => `Question ${ordinal}`)
+                              .join("、")}
+                          </p>
+                        </div>
+                      ))}
+                      <details className="rounded-lg border border-[var(--border)] p-3">
+                        <summary className="cursor-pointer font-semibold">完整 Benchmark</summary>
+                        <p className="mt-2 whitespace-pre-wrap">{benchmark.text}</p>
+                      </details>
+                      <details className="rounded-lg border border-[var(--border)] p-3">
+                        <summary className="cursor-pointer font-semibold">五维 Rubric</summary>
+                        <div className="mt-2 grid gap-2">
+                          {evaluation.dimensions.map((dimension) => (
+                            <div key={dimension.dimension}>
+                              <p className="font-medium">
+                                {dimension.dimension}：{dimension.verdict}
+                              </p>
+                              <p className="text-slate-600">{dimension.rationale}</p>
+                              {dimension.answerExcerpts.length > 0 ? (
+                                <p className="text-xs text-slate-600">
+                                  原回答摘录：{dimension.answerExcerpts.join("；")}
+                                </p>
+                              ) : null}
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    </article>
+                  );
+                })}
+                {selectedSession.state.checkpoint.findings.length === 0 ? (
+                  <p className="rounded-lg bg-white p-3 font-medium">
+                    未发现有充分依据的 GapFinding。
+                  </p>
+                ) : null}
+                <p className="text-xs text-slate-600">
+                  所有 GapFinding 当前均为 unreviewed；Step 5 才能校准。
+                </p>
+              </section>
             ) : null}
             <ol className="grid gap-2 text-sm" aria-label="Session timeline">
               {timeline.map((event) => (

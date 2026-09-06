@@ -63,12 +63,12 @@ interface SessionEngine {
 
 - session 状态机与合法转换。
 - `QuestionTurn` 计数和规范化重复问题检测。
-- A2A/A2H 与控制权；Step 3 只实现从 A2A 到粘性 A2H 的 `Take Over`。
+- A2A/A2H 与控制权；当前只实现从 A2A 到粘性 A2H 的 `Take Over`。
 - provider request 预算和 token usage。
 - `Checkpoint`、finding calibration、`LearningGap`、提示和 `Rechallenge`。
 - per-session serialization、operation token、idempotency 和错误恢复。
 
-截至 Core Loop Step 3，`SessionCommand` 是以下 discriminated union：
+截至 Core Loop Step 4，`SessionCommand` 是以下 discriminated union：
 
 ```ts
 type SessionCommand =
@@ -77,18 +77,19 @@ type SessionCommand =
   | { type: "start"; sessionId: string; idempotencyKey: string }
   | { type: "request_ai_answer"; sessionId: string; idempotencyKey: string }
   | { type: "request_next_question"; sessionId: string; idempotencyKey: string }
+  | { type: "generate_checkpoint"; sessionId: string; idempotencyKey: string }
   | { type: "take_over"; sessionId: string; idempotencyKey: string }
   | { type: "submit_human_answer"; sessionId: string; answer: string; idempotencyKey: string };
 ```
 
 命令的合法前置状态、可观察事件、错误类别和重复提交结果属于 Interface contract，并通过 Interface tests 固定。
-`request_ai_answer` 只结算当前回答，`request_next_question` 只在上一题已结算且链未结束时生成下一题；两者不会在一次 command 中级联。后续 milestone 才会增加 Checkpoint、calibration、hint、Rechallenge、budget extension 与通用错误恢复命令。
+`request_ai_answer` 只结算当前回答，`request_next_question` 只在上一题已结算且链未结束时生成下一题；两者不会在一次 command 中级联。`generate_checkpoint` 只在链已完成、至少存在一个 human answer 且尚无 Checkpoint 时运行固定三阶段编排；成功结果不可重新生成。后续步骤才会增加 calibration、hint、Rechallenge、budget extension 与通用错误恢复命令。
 
 ## InterviewAgents Module
 
 `InterviewAgents` 向 `SessionEngine` 暴露领域操作，而不是通用 chat primitive：
 
-- Step 3 的 Interface 暴露 `planSingleAttackChain`、`generateNextQuestion` 与 `generateCandidateAnswer`；后续步骤按 milestone 增加下面的领域操作，不暴露通用 chat 方法。
+- Step 4 的 Interface 暴露 `planSingleAttackChain`、`generateNextQuestion`、`generateCandidateAnswer`、`evaluateHumanAnswer`、`generateBenchmarks` 与 `generateCheckpointReport`；后续步骤按 milestone 增加其他领域操作，不暴露通用 chat 方法。
 
 - 生成结构化 InterviewPlan。
 - 生成下一问题。
@@ -120,8 +121,9 @@ production Adapter 为每个角色维护独立的 `OpenAI client → OpenAIProvi
 每个 operation 重新组装最小角色上下文，不共享可变 message history：
 
 - `Interviewer` 可见访谈所需的 `ProviderView`、InterviewPlan、当前链和公开 transcript；不可调用 repo 工具，也不可见隐藏的 `Judge` 分析。
-- `Candidate` 在 Step 3 只可见 bounded evidence packet、JD/岗位/职级、当前问题与此前 settled public transcript；不可见完整 `ProviderView`、原始 `ProfileSnapshot`、隐藏计划字段、`Judge` 数据、operation token 或 repo capability。后续启用 repo grounding 时才接入受限只读证据工具。
-- `Judge` 可见 rubric、待评回答、必要上下文与证据工具；其内部判定只通过 `SessionEngine` 选择的产品字段向用户披露。
+- `Candidate` 回答 operation 只可见 bounded evidence packet、JD/岗位/职级、当前问题与此前 settled public transcript。`Candidate` Benchmark operation 只可见 bounded evidence、hiring bar、knowledge target，以及按序的 human question/turn ID；不接收 human answer、Judge evaluation 或完整 transcript。
+- `Judge` 单题评价只可见固定 rubric、当前 human question/answer、此前 settled public transcript、hiring bar、knowledge target 与 bounded evidence；不接收 `Benchmark`。综合 operation 才接收冻结的 evaluations、Benchmarks、human answers、必要 public transcript 与 bounded evidence。
+- Step 4 的所有 Candidate/Judge operation 都不可见完整 `ProviderView`、原始 `ProfileSnapshot`、完整隐藏计划、其他角色 generation、operation token、repo capability 或 secret；repo grounding 尚未接入。
 
 用户可见的 `Candidate` 输出与问题一旦展示，就成为 timeline 事实。角色切换不会把其他角色的隐藏上下文转交给新角色。
 
@@ -134,18 +136,20 @@ production Adapter 为每个角色维护独立的 `OpenAI client → OpenAIProvi
 
 这不是完整 event sourcing；current state 是权威的运行快照，不要求从 timeline 重建所有内部状态。
 
-current state 使用版本化 Zod schema，并保存创建 `Session` 时的完整 core-loop policy snapshot。Step 3 使用 `SessionStateV3` 与 `core-loop-v2`，新增 `candidate-answer-v1` 和 4000 Unicode 字符回答上限；既有 chain、planner、question contract 版本不变。内部 state 经显式 `SessionView` 投影后才可公开；证据附近上下文、问题规范化 key、Candidate generation、operation token、未展示候选和逐请求明细不进入公开 state 投影。安全的 Candidate generation metadata 只随 `answer_recorded` timeline event 公开。timeline event 使用共享的 Zod discriminated union 校验。
+current state 使用版本化 Zod schema，并保存创建 `Session` 时的完整 core-loop policy snapshot。Step 4 使用 `SessionStateV4` 与 `core-loop-v3`；保留既有 chain、planner、question、candidate-answer contract，并新增 `answer-rubric-v1`、`judge-turn-evaluation-v1`、`candidate-benchmark-v1` 与 `judge-checkpoint-v1`。内部 state 经显式 `SessionView` 投影后才可公开；证据附近上下文、问题规范化 key、角色 generation、operation token、未展示候选和逐请求明细不进入公开 state 投影。安全的 generation metadata 只随对应 timeline event 公开。timeline event 使用共享的 Zod discriminated union 校验。
+
+Checkpoint 内部状态为 `evaluating | benchmarking | synthesizing | completed`。每个 human turn 的评价在下一次模型调用前以短 transaction 保存，Benchmark batch 随后以短 transaction 保存；`SessionView`、HTTP response、SSE 与 DOM 只在 `completed` 后投影完整公共 Checkpoint，失败前的半成品保持隐藏。
 
 外部模型调用期间不持有 SQLite transaction。一次可能调用 provider 的命令按以下协议运行：
 
 1. 在短 transaction 中校验状态与 idempotency key，写入唯一 operation token，并保留该 `Session` 的串行执行权。
 2. transaction 外调用 `InterviewAgents`。
-3. 在新的短 transaction 中按 operation token 比对预期状态；只提交一次 domain result、usage、timeline events 和新 current state。
-4. 进程中断后，将未完成 operation 标记为显式错误。Step 3 的 Candidate 回答中断仍可在同题 `Take Over`；Interviewer 追问失败保持错误态，通用 `resume_error` 留到 Step 7。
+3. 在新的短 transaction 中按 operation token 比对预期状态；普通 operation 只提交一次 domain result、usage、timeline events 和新 current state。Checkpoint 在三个固定阶段边界保存内部进度，但只在最终 transaction 公开结果。
+4. 进程中断后，将未完成 operation 标记为显式错误。Candidate 回答中断仍可在同题 `Take Over`；Interviewer 追问或 Checkpoint 任一阶段失败保持错误态，通用 `resume_error` 留到 Step 7。
 
 相同 idempotency key 与相同 command payload 重复提交时返回第一次终态结果，不重复推进流程或扣减已记录 usage；重放不会改变原结果的 `status`。相同 key 携带不同 command type 或 payload 时返回 `idempotency_key_conflict`。确定性拒绝属于终态并保存；`session_busy` 等尚未形成终态的并发结果不消耗 key。并发 action 只能有一个获得相应 session operation token。
 
-应用数据库使用显式 epoch。普通启动遇到含数据的旧 epoch 时 fail closed，并提示运行 `pnpm db:reset -- --confirm-reset`；不会自动迁移或删除旧应用数据。确认 reset 只删除配置的数据库文件及其 SQLite WAL/SHM/journal sidecar，随后创建空库并执行 migrations。
+应用数据库使用显式 epoch；Step 4 的 epoch 为 4。普通启动遇到含数据的旧 epoch 时 fail closed，并提示运行 `pnpm db:reset -- --confirm-reset`；不会自动迁移或删除旧应用数据。确认 reset 只删除配置的数据库文件及其 SQLite WAL/SHM/journal sidecar，随后创建空库并执行 migrations。
 
 ## Provider 与预算
 
@@ -225,6 +229,6 @@ GET    /api/sessions/:id/events
 GET    /api/config/providers
 ```
 
-`POST /actions` 只接收 `SessionCommand` 的 transport representation；所有状态转换仍由 `SessionEngine.dispatch` 决定，成功响应携带最新 `SessionView`。`GET /events` 使用 SSE 发布可公开的 timeline 更新，支持断线后按 event id 续读；客户端按 sequence 合并去重。它不发送 prompt、hidden reasoning、API key 或未披露的 `Judge` 数据。
+`POST /actions` 只接收 `SessionCommand` 的 transport representation；所有状态转换仍由 `SessionEngine.dispatch` 决定，成功响应携带最新 `SessionView`。`GET /events` 使用 SSE 发布可公开的 timeline 更新，支持断线后按 event id 续读；客户端按 sequence 合并去重。Step 4 新增 `turn_evaluation_recorded`、`benchmarks_generated` 与 `checkpoint_generated`；前两者只携带安全标识和 generation metadata，最后一个携带完整公共 Checkpoint。接口不发送 prompt、provider payload、hidden reasoning、API key 或未披露的 Judge/Checkpoint 半成品。
 
 所有 `/api` 请求只接受 loopback Host；`POST`、`PATCH` 与 `DELETE` 还要求 `Origin` 与当前 request origin 相同。Session 写请求必须携带经过 runtime validation 的 `Idempotency-Key`。创建 `Session` 时，客户端先生成 UUID identity，再提交 `{ sessionId, profileId }`；同一次网络重试复用完整 command 与 key。

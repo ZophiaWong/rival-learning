@@ -11,12 +11,23 @@ import {
   type QuestionSemanticRejectionReason,
 } from "@/server/core-loop/attack-chain-execution";
 import {
+  materializeBenchmarkBatchCandidate,
+  materializeCheckpointReportCandidate,
+  materializeTurnEvaluationCandidate,
+  type BenchmarkSemanticRejectionReason,
+  type CheckpointSemanticRejectionReason,
+  type EvaluationSemanticRejectionReason,
+} from "@/server/core-loop/checkpoint";
+import {
   answerTextSchema,
   generationMetadataSchema,
+  type BenchmarkBatch,
   type GenerationMetadata,
   type GenerationUsage,
   type InterviewLanguage,
+  type QuestionTurn,
   type ReadyAttackChain,
+  type TurnEvaluation,
 } from "@/server/core-loop/domain";
 import {
   materializeInterviewPlanCandidate,
@@ -24,10 +35,7 @@ import {
   type PlanSemanticRejectionReason,
   type PlanningInputSizes,
 } from "@/server/core-loop/grounding";
-import {
-  CORE_LOOP_V2_POLICY,
-  createCoreLoopPolicySnapshot,
-} from "@/server/core-loop/policy";
+import { CORE_LOOP_V3_POLICY, createCoreLoopPolicySnapshot } from "@/server/core-loop/policy";
 import type { InterviewAgents, PublicTranscriptTurn } from "@/server/interview-agents";
 import {
   ProfileNotFoundError,
@@ -37,11 +45,13 @@ import {
 } from "@/server/preparation-profiles";
 import {
   projectSessionState,
-  sessionStateV3Schema,
+  projectCheckpoint,
+  sessionStateV4Schema,
+  type CheckpointStage,
   type PublicSessionState,
   type SessionOperation,
   type SessionPhase,
-  type SessionStateV3,
+  type SessionStateV4,
 } from "./state";
 import {
   parseTimelineEvent,
@@ -85,6 +95,7 @@ export type SessionCommand =
   | { type: "start"; sessionId: string; idempotencyKey: string }
   | { type: "request_ai_answer"; sessionId: string; idempotencyKey: string }
   | { type: "request_next_question"; sessionId: string; idempotencyKey: string }
+  | { type: "generate_checkpoint"; sessionId: string; idempotencyKey: string }
   | { type: "take_over"; sessionId: string; idempotencyKey: string }
   | {
       type: "submit_human_answer";
@@ -102,7 +113,10 @@ export type ActionUnavailableReason =
   | "attack_chain_completed"
   | "candidate_control_required"
   | "human_control_required"
-  | "human_already_controls";
+  | "human_already_controls"
+  | "attack_chain_not_completed"
+  | "no_human_answers"
+  | "checkpoint_already_generated";
 
 export interface SessionCommandError {
   code: string;
@@ -113,6 +127,7 @@ export interface SessionCommandError {
     rejectionCounts?: Record<string, number>;
     lastRejectionReason?: string | null;
     reason?: ActionUnavailableReason | "empty" | "too_long";
+    stage?: CheckpointStage;
   };
 }
 
@@ -152,12 +167,13 @@ interface SessionRow {
 interface InternalSession {
   row: SessionRow;
   profileSnapshot: ProfileSnapshot;
-  state: SessionStateV3;
+  state: SessionStateV4;
 }
 
 interface ReservedOperation {
+  sessionId: string;
   operationToken: string;
-  state: SessionStateV3;
+  state: SessionStateV4;
   event: TimelineEvent;
 }
 
@@ -229,7 +245,7 @@ function incrementCount(counts: Record<string, number>, reason: string): void {
 }
 
 function settledPublicTranscript(
-  execution: NonNullable<SessionStateV3["execution"]>,
+  execution: NonNullable<SessionStateV4["execution"]>,
 ): PublicTranscriptTurn[] {
   return execution.turns
     .filter((turn) => turn.status === "settled" && turn.answer)
@@ -239,12 +255,40 @@ function settledPublicTranscript(
     }));
 }
 
+function humanTurns(
+  execution: NonNullable<SessionStateV4["execution"]>,
+): QuestionTurn[] {
+  return execution.turns
+    .filter(
+      (turn): turn is QuestionTurn & { answer: { actor: "human"; text: string } } =>
+        turn.status === "settled" && turn.answer?.actor === "human",
+    )
+    .sort((left, right) => left.ordinal - right.ordinal);
+}
+
+function publicTranscriptBefore(
+  execution: NonNullable<SessionStateV4["execution"]>,
+  turnId: string,
+): PublicTranscriptTurn[] {
+  const index = execution.turns.findIndex((turn) => turn.id === turnId);
+  return settledPublicTranscript({
+    ...execution,
+    turns: index < 0 ? [] : execution.turns.slice(0, index),
+  });
+}
+
 function contractVersionForOperation(
-  policy: SessionStateV3["policy"],
+  policy: SessionStateV4["policy"],
   operation: SessionOperation,
+  checkpointStage: CheckpointStage | null = null,
 ): GenerationMetadata["contractVersion"] {
   if (operation === "generate_plan") return policy.plannerContractVersion;
   if (operation === "request_ai_answer") return policy.candidateAnswerContractVersion;
+  if (operation === "generate_checkpoint") {
+    if (checkpointStage === "benchmarking") return policy.benchmarkContractVersion;
+    if (checkpointStage === "synthesizing") return policy.checkpointContractVersion;
+    return policy.judgeEvaluationContractVersion;
+  }
   return policy.questionContractVersion;
 }
 
@@ -258,6 +302,9 @@ function localizedFailureMessage(
     if (operation === "start") return language === "zh-CN" ? "首个问题" : "first question";
     if (operation === "request_ai_answer") {
       return language === "zh-CN" ? "Candidate 回答" : "Candidate answer";
+    }
+    if (operation === "generate_checkpoint") {
+      return language === "zh-CN" ? "Checkpoint" : "Checkpoint";
     }
     return language === "zh-CN" ? "下一问题" : "next question";
   })();
@@ -324,6 +371,7 @@ class ApplicationSessionEngine implements SessionEngine {
     if (command.type === "start") return this.startSession(command);
     if (command.type === "request_ai_answer") return this.requestAiAnswer(command);
     if (command.type === "request_next_question") return this.requestNextQuestion(command);
+    if (command.type === "generate_checkpoint") return this.generateCheckpoint(command);
     if (command.type === "take_over") return this.takeOver(command);
     return this.submitHumanAnswer(command);
   }
@@ -386,7 +434,7 @@ class ApplicationSessionEngine implements SessionEngine {
     return {
       row,
       profileSnapshot: JSON.parse(row.profile_snapshot_json) as ProfileSnapshot,
-      state: sessionStateV3Schema.parse(JSON.parse(row.state_json) as unknown),
+      state: sessionStateV4Schema.parse(JSON.parse(row.state_json) as unknown),
     };
   }
 
@@ -417,13 +465,14 @@ class ApplicationSessionEngine implements SessionEngine {
     }
 
     const timestamp = this.now();
-    const state = sessionStateV3Schema.parse({
-      stateVersion: 3,
+    const state = sessionStateV4Schema.parse({
+      stateVersion: 4,
       phase: "draft",
       interviewLanguage: command.interviewLanguage,
       policy: createCoreLoopPolicySnapshot(),
       planRecord: null,
       execution: null,
+      checkpoint: null,
       activeOperation: null,
       failedOperation: null,
     });
@@ -479,7 +528,7 @@ class ApplicationSessionEngine implements SessionEngine {
       return this.commitRejection(command, this.invalidState("generate plan", session.state.phase));
     }
 
-    const reserved = this.reserveOperation(command.sessionId, session, "generate_plan");
+    const reserved = this.reserveOperation(command, session);
     if (!reserved) return this.sessionBusy("generate plan");
 
     const sizes = measurePlanningInput(session.profileSnapshot.providerView);
@@ -577,7 +626,7 @@ class ApplicationSessionEngine implements SessionEngine {
       return this.commitRejection(command, this.invalidState("start Session", session.state.phase));
     }
 
-    const reserved = this.reserveOperation(command.sessionId, session, "start");
+    const reserved = this.reserveOperation(command, session);
     if (!reserved) return this.sessionBusy("start Session");
     const initialExecution = createAttackChainExecutionState(chain.id);
     let generation = emptyGeneration(reserved.state.policy.questionContractVersion);
@@ -689,7 +738,7 @@ class ApplicationSessionEngine implements SessionEngine {
       );
     }
 
-    const reserved = this.reserveOperation(command.sessionId, session, "request_ai_answer");
+    const reserved = this.reserveOperation(command, session);
     if (!reserved) return this.sessionBusy("request a Candidate answer");
     const candidate = await this.safeCandidateAnswer({
       operationToken: reserved.operationToken,
@@ -803,7 +852,7 @@ class ApplicationSessionEngine implements SessionEngine {
       );
     }
 
-    const reserved = this.reserveOperation(command.sessionId, session, "request_next_question");
+    const reserved = this.reserveOperation(command, session);
     if (!reserved) return this.sessionBusy("request the next question");
     let generation = emptyGeneration(reserved.state.policy.questionContractVersion);
     const rejectionCounts: Record<string, number> = {};
@@ -868,6 +917,376 @@ class ApplicationSessionEngine implements SessionEngine {
     });
   }
 
+  private async generateCheckpoint(
+    command: Extract<SessionCommand, { type: "generate_checkpoint" }>,
+  ): Promise<DispatchResult> {
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) return idempotencyResult;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token || session.state.activeOperation) {
+      return this.sessionBusy("generate Checkpoint");
+    }
+    if (session.state.phase !== "active") {
+      const reason = session.state.phase === "error" ? "session_in_error" : "session_not_active";
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("generate_checkpoint", reason),
+      );
+    }
+    const execution = session.state.execution;
+    const record = session.state.planRecord;
+    if (!execution || execution.status !== "completed" || !record?.questionContext) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("generate_checkpoint", "attack_chain_not_completed"),
+      );
+    }
+    if (session.state.checkpoint) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("generate_checkpoint", "checkpoint_already_generated"),
+      );
+    }
+    const turns = humanTurns(execution);
+    if (turns.length === 0) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("generate_checkpoint", "no_human_answers"),
+      );
+    }
+    const chain = record.plan.attackChains[0];
+    if (chain.status !== "ready") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("generate_checkpoint", "session_not_active"),
+      );
+    }
+
+    let reserved = this.reserveOperation(command, session, {
+      status: "evaluating",
+      chainId: chain.id,
+      humanTurnIds: turns.map((turn) => turn.id),
+      evaluations: [],
+      benchmarkBatch: null,
+      result: null,
+      startedAt: this.now().toISOString(),
+    });
+    if (!reserved) return this.sessionBusy("generate Checkpoint");
+    const appliedEvents: TimelineEvent[] = [reserved.event];
+    const evaluations: TurnEvaluation[] = [];
+
+    for (const turn of turns) {
+      const answer = turn.answer;
+      if (!answer || answer.actor !== "human") {
+        return this.commitOperationFailure({
+          command,
+          reserved,
+          stage: "evaluating",
+          code: "human_answer_required",
+          retryable: false,
+          generation: emptyGeneration(reserved.state.policy.judgeEvaluationContractVersion),
+          rejectionCounts: {},
+          lastRejectionReason: null,
+        });
+      }
+      let generation = emptyGeneration(reserved.state.policy.judgeEvaluationContractVersion);
+      const rejectionCounts: Record<string, number> = {};
+      const semanticRejections: string[] = [];
+      let lastReason: EvaluationSemanticRejectionReason | null = null;
+      let acceptedEvaluation: TurnEvaluation | null = null;
+      for (
+        let candidateNumber = 1;
+        candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
+        candidateNumber += 1
+      ) {
+        const candidate = await this.safeTurnEvaluation({
+          operationToken: reserved.operationToken,
+          interviewLanguage: reserved.state.interviewLanguage,
+          rubricVersion: reserved.state.policy.rubricVersion,
+          questionContext: record.questionContext,
+          jobDescription: session.profileSnapshot.providerView.jobDescription,
+          targetRole: session.profileSnapshot.providerView.targetRole,
+          targetLevel: session.profileSnapshot.providerView.targetLevel,
+          knowledgeTarget: chain.knowledgeTarget,
+          currentTurn: {
+            id: turn.id,
+            question: turn.question.text,
+            answer: answer.text,
+          },
+          priorPublicTranscript: publicTranscriptBefore(execution, turn.id),
+          semanticRejections,
+        });
+        generation = mergeGeneration(generation, candidate.generation);
+        if (candidate.status === "failure") {
+          return this.commitOperationFailure({
+            command,
+            reserved,
+            stage: "evaluating",
+            code: candidate.code,
+            retryable: candidate.retryable,
+            generation,
+            rejectionCounts,
+            lastRejectionReason: lastReason,
+          });
+        }
+        const materialized = materializeTurnEvaluationCandidate({
+          turn,
+          candidate: candidate.value,
+          generation,
+          rubricVersion: reserved.state.policy.rubricVersion,
+          createdAt: this.now().toISOString(),
+        });
+        if (materialized.status === "rejected") {
+          lastReason = materialized.reason;
+          incrementCount(rejectionCounts, materialized.reason);
+          semanticRejections.push(materialized.reason);
+          continue;
+        }
+        acceptedEvaluation = materialized.evaluation;
+        break;
+      }
+      if (!acceptedEvaluation) {
+        return this.commitOperationFailure({
+          command,
+          reserved,
+          stage: "evaluating",
+          code: "semantic_candidates_exhausted",
+          retryable: true,
+          generation,
+          rejectionCounts,
+          lastRejectionReason: lastReason,
+          details: { rejectionCounts, lastRejectionReason: lastReason, stage: "evaluating" },
+        });
+      }
+      evaluations.push(acceptedEvaluation);
+      const evaluationEvent = parseTimelineEvent({
+        sequence: reserved.event.sequence + 1,
+        type: "turn_evaluation_recorded",
+        payload: {
+          chainId: chain.id,
+          turnId: turn.id,
+          rubricVersion: reserved.state.policy.rubricVersion,
+          generation: acceptedEvaluation.generation,
+        },
+        createdAt: this.now().toISOString(),
+      });
+      const nextState = sessionStateV4Schema.parse({
+        ...reserved.state,
+        checkpoint: {
+          ...reserved.state.checkpoint!,
+          status: evaluations.length === turns.length ? "benchmarking" : "evaluating",
+          evaluations,
+        },
+      });
+      const progressed = this.commitCheckpointProgress(reserved, nextState, evaluationEvent);
+      if (!progressed) return this.operationConflict();
+      reserved = progressed;
+      appliedEvents.push(evaluationEvent);
+    }
+
+    let benchmarkGeneration = emptyGeneration(reserved.state.policy.benchmarkContractVersion);
+    const benchmarkRejectionCounts: Record<string, number> = {};
+    const benchmarkSemanticRejections: string[] = [];
+    let benchmarkLastReason: BenchmarkSemanticRejectionReason | null = null;
+    let benchmarkBatch: BenchmarkBatch | null = null;
+    for (
+      let candidateNumber = 1;
+      candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
+      candidateNumber += 1
+    ) {
+      const candidate = await this.safeBenchmarks({
+        operationToken: reserved.operationToken,
+        interviewLanguage: reserved.state.interviewLanguage,
+        questionContext: record.questionContext,
+        jobDescription: session.profileSnapshot.providerView.jobDescription,
+        targetRole: session.profileSnapshot.providerView.targetRole,
+        targetLevel: session.profileSnapshot.providerView.targetLevel,
+        knowledgeTarget: chain.knowledgeTarget,
+        humanQuestions: turns.map((turn) => ({
+          turnId: turn.id,
+          question: turn.question.text,
+          evidenceAnchorIds: turn.question.evidenceAnchorIds,
+        })),
+        semanticRejections: benchmarkSemanticRejections,
+      });
+      benchmarkGeneration = mergeGeneration(benchmarkGeneration, candidate.generation);
+      if (candidate.status === "failure") {
+        return this.commitOperationFailure({
+          command,
+          reserved,
+          stage: "benchmarking",
+          code: candidate.code,
+          retryable: candidate.retryable,
+          generation: benchmarkGeneration,
+          rejectionCounts: benchmarkRejectionCounts,
+          lastRejectionReason: benchmarkLastReason,
+        });
+      }
+      const materialized = materializeBenchmarkBatchCandidate({
+        humanTurns: turns,
+        candidate: candidate.value,
+        generation: benchmarkGeneration,
+        createdAt: this.now().toISOString(),
+      });
+      if (materialized.status === "rejected") {
+        benchmarkLastReason = materialized.reason;
+        incrementCount(benchmarkRejectionCounts, materialized.reason);
+        benchmarkSemanticRejections.push(materialized.reason);
+        continue;
+      }
+      benchmarkBatch = materialized.batch;
+      break;
+    }
+    if (!benchmarkBatch) {
+      return this.commitOperationFailure({
+        command,
+        reserved,
+        stage: "benchmarking",
+        code: "semantic_candidates_exhausted",
+        retryable: true,
+        generation: benchmarkGeneration,
+        rejectionCounts: benchmarkRejectionCounts,
+        lastRejectionReason: benchmarkLastReason,
+        details: {
+          rejectionCounts: benchmarkRejectionCounts,
+          lastRejectionReason: benchmarkLastReason,
+          stage: "benchmarking",
+        },
+      });
+    }
+    const benchmarkEvent = parseTimelineEvent({
+      sequence: reserved.event.sequence + 1,
+      type: "benchmarks_generated",
+      payload: {
+        chainId: chain.id,
+        turnIds: turns.map((turn) => turn.id),
+        count: turns.length,
+        generation: benchmarkBatch.generation,
+      },
+      createdAt: this.now().toISOString(),
+    });
+    const benchmarkState = sessionStateV4Schema.parse({
+      ...reserved.state,
+      checkpoint: {
+        ...reserved.state.checkpoint!,
+        status: "synthesizing",
+        benchmarkBatch,
+      },
+    });
+    const benchmarkProgress = this.commitCheckpointProgress(
+      reserved,
+      benchmarkState,
+      benchmarkEvent,
+    );
+    if (!benchmarkProgress) return this.operationConflict();
+    reserved = benchmarkProgress;
+    appliedEvents.push(benchmarkEvent);
+
+    let checkpointGeneration = emptyGeneration(reserved.state.policy.checkpointContractVersion);
+    const checkpointRejectionCounts: Record<string, number> = {};
+    const checkpointSemanticRejections: string[] = [];
+    let checkpointLastReason: CheckpointSemanticRejectionReason | null = null;
+    for (
+      let candidateNumber = 1;
+      candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
+      candidateNumber += 1
+    ) {
+      const candidate = await this.safeCheckpointReport({
+        operationToken: reserved.operationToken,
+        interviewLanguage: reserved.state.interviewLanguage,
+        questionContext: record.questionContext,
+        jobDescription: session.profileSnapshot.providerView.jobDescription,
+        targetRole: session.profileSnapshot.providerView.targetRole,
+        targetLevel: session.profileSnapshot.providerView.targetLevel,
+        knowledgeTarget: chain.knowledgeTarget,
+        humanTurns: turns.map((turn) => ({
+          turnId: turn.id,
+          question: turn.question.text,
+          answer: turn.answer!.text,
+        })),
+        evaluations: evaluations.map((evaluation) => ({
+          turnId: evaluation.turnId,
+          dimensions: evaluation.dimensions,
+        })),
+        benchmarks: benchmarkBatch.benchmarks,
+        publicTranscript: settledPublicTranscript(execution),
+        semanticRejections: checkpointSemanticRejections,
+      });
+      checkpointGeneration = mergeGeneration(checkpointGeneration, candidate.generation);
+      if (candidate.status === "failure") {
+        return this.commitOperationFailure({
+          command,
+          reserved,
+          stage: "synthesizing",
+          code: candidate.code,
+          retryable: candidate.retryable,
+          generation: checkpointGeneration,
+          rejectionCounts: checkpointRejectionCounts,
+          lastRejectionReason: checkpointLastReason,
+        });
+      }
+      const materialized = materializeCheckpointReportCandidate({
+        chainId: chain.id,
+        humanTurns: turns,
+        evaluations,
+        benchmarkBatch,
+        candidate: candidate.value,
+        generation: checkpointGeneration,
+        createId: this.createEntityId,
+        completedAt: this.now().toISOString(),
+      });
+      if (materialized.status === "rejected") {
+        checkpointLastReason = materialized.reason;
+        incrementCount(checkpointRejectionCounts, materialized.reason);
+        checkpointSemanticRejections.push(materialized.reason);
+        continue;
+      }
+      const completedState = sessionStateV4Schema.parse({
+        ...reserved.state,
+        activeOperation: null,
+        failedOperation: null,
+        checkpoint: {
+          ...reserved.state.checkpoint!,
+          status: "completed",
+          result: materialized.checkpoint,
+        },
+      });
+      const checkpointEvent = parseTimelineEvent({
+        sequence: reserved.event.sequence + 1,
+        type: "checkpoint_generated",
+        payload: {
+          checkpoint: projectCheckpoint(materialized.checkpoint),
+          generation: materialized.checkpoint.generation,
+        },
+        createdAt: this.now().toISOString(),
+      });
+      return this.commitCheckpointSuccess(
+        command,
+        reserved,
+        completedState,
+        [...appliedEvents, checkpointEvent],
+        checkpointEvent,
+      );
+    }
+
+    return this.commitOperationFailure({
+      command,
+      reserved,
+      stage: "synthesizing",
+      code: "semantic_candidates_exhausted",
+      retryable: true,
+      generation: checkpointGeneration,
+      rejectionCounts: checkpointRejectionCounts,
+      lastRejectionReason: checkpointLastReason,
+      details: {
+        rejectionCounts: checkpointRejectionCounts,
+        lastRejectionReason: checkpointLastReason,
+        stage: "synthesizing",
+      },
+    });
+  }
+
   private takeOver(
     command: Extract<SessionCommand, { type: "take_over" }>,
   ): DispatchResult {
@@ -917,7 +1336,7 @@ class ApplicationSessionEngine implements SessionEngine {
         this.actionUnavailable("take_over", "no_pending_question"),
       );
     }
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...session.state,
       phase: "active",
       execution: transition.state,
@@ -944,7 +1363,7 @@ class ApplicationSessionEngine implements SessionEngine {
         status: "rejected",
         error: {
           code: "invalid_human_answer",
-          message: `Human answer must contain 1-${CORE_LOOP_V2_POLICY.textLimits.answer} Unicode characters`,
+          message: `Human answer must contain 1-${CORE_LOOP_V3_POLICY.textLimits.answer} Unicode characters`,
           details: { reason },
         },
       });
@@ -1014,7 +1433,7 @@ class ApplicationSessionEngine implements SessionEngine {
       ...settled.events,
       ...(completion?.status === "accepted" ? completion.events : []),
     ];
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...session.state,
       execution: executionAfterAnswer,
       activeOperation: null,
@@ -1034,7 +1453,7 @@ class ApplicationSessionEngine implements SessionEngine {
         code: "agent_unexpected_error",
         message: "Unexpected InterviewAgents failure",
         retryable: false,
-        generation: emptyGeneration(CORE_LOOP_V2_POLICY.plannerContractVersion),
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.plannerContractVersion),
       };
     }
   }
@@ -1050,7 +1469,7 @@ class ApplicationSessionEngine implements SessionEngine {
         code: "agent_unexpected_error",
         message: "Unexpected InterviewAgents failure",
         retryable: false,
-        generation: emptyGeneration(CORE_LOOP_V2_POLICY.questionContractVersion),
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.questionContractVersion),
       };
     }
   }
@@ -1066,26 +1485,78 @@ class ApplicationSessionEngine implements SessionEngine {
         code: "agent_unexpected_error",
         message: "Unexpected InterviewAgents failure",
         retryable: false,
-        generation: emptyGeneration(CORE_LOOP_V2_POLICY.candidateAnswerContractVersion),
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.candidateAnswerContractVersion),
+      };
+    }
+  }
+
+  private async safeTurnEvaluation(
+    input: Parameters<InterviewAgents["evaluateHumanAnswer"]>[0],
+  ): ReturnType<InterviewAgents["evaluateHumanAnswer"]> {
+    try {
+      return await this.interviewAgents.evaluateHumanAnswer(input);
+    } catch {
+      return {
+        status: "failure",
+        code: "agent_unexpected_error",
+        message: "Unexpected InterviewAgents failure",
+        retryable: false,
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.judgeEvaluationContractVersion),
+      };
+    }
+  }
+
+  private async safeBenchmarks(
+    input: Parameters<InterviewAgents["generateBenchmarks"]>[0],
+  ): ReturnType<InterviewAgents["generateBenchmarks"]> {
+    try {
+      return await this.interviewAgents.generateBenchmarks(input);
+    } catch {
+      return {
+        status: "failure",
+        code: "agent_unexpected_error",
+        message: "Unexpected InterviewAgents failure",
+        retryable: false,
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.benchmarkContractVersion),
+      };
+    }
+  }
+
+  private async safeCheckpointReport(
+    input: Parameters<InterviewAgents["generateCheckpointReport"]>[0],
+  ): ReturnType<InterviewAgents["generateCheckpointReport"]> {
+    try {
+      return await this.interviewAgents.generateCheckpointReport(input);
+    } catch {
+      return {
+        status: "failure",
+        code: "agent_unexpected_error",
+        message: "Unexpected InterviewAgents failure",
+        retryable: false,
+        generation: emptyGeneration(CORE_LOOP_V3_POLICY.checkpointContractVersion),
       };
     }
   }
 
   private reserveOperation(
-    sessionId: string,
+    command: Extract<SessionCommand, { type: SessionOperation }>,
     session: InternalSession,
-    operation: SessionOperation,
+    checkpoint?: NonNullable<SessionStateV4["checkpoint"]>,
   ): ReservedOperation | null {
+    const sessionId = command.sessionId;
+    const operation = command.type;
     const operationToken = this.createOperationToken();
     const timestamp = this.now();
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...session.state,
       activeOperation: {
         type: operation,
         token: operationToken,
+        idempotencyKey: command.idempotencyKey,
         priorPhase: session.state.phase,
         startedAt: timestamp.toISOString(),
       },
+      checkpoint: checkpoint ?? session.state.checkpoint,
       failedOperation: null,
     });
     const event = parseTimelineEvent({
@@ -1111,17 +1582,17 @@ class ApplicationSessionEngine implements SessionEngine {
       this.insertTimelineEvent(sessionId, event);
       return true;
     })();
-    return committed ? { operationToken, state: nextState, event } : null;
+    return committed ? { sessionId, operationToken, state: nextState, event } : null;
   }
 
   private commitPlan(
     command: Extract<SessionCommand, { type: "generate_plan" }>,
     reserved: ReservedOperation,
-    record: NonNullable<SessionStateV3["planRecord"]>,
+    record: NonNullable<SessionStateV4["planRecord"]>,
   ): DispatchResult {
     const timestamp = this.now();
     const chain = record.plan.attackChains[0];
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...reserved.state,
       phase: "planned",
       planRecord: record,
@@ -1142,11 +1613,11 @@ class ApplicationSessionEngine implements SessionEngine {
     command: Extract<SessionCommand, { type: "start" }>,
     reserved: ReservedOperation,
     chain: ReadyAttackChain,
-    execution: NonNullable<SessionStateV3["execution"]>,
+    execution: NonNullable<SessionStateV4["execution"]>,
     generation: GenerationMetadata,
   ): DispatchResult {
     const timestamp = this.now();
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...reserved.state,
       phase: "active",
       execution,
@@ -1193,11 +1664,11 @@ class ApplicationSessionEngine implements SessionEngine {
       { type: "request_ai_answer" | "request_next_question" }
     >,
     reserved: ReservedOperation,
-    execution: NonNullable<SessionStateV3["execution"]>,
+    execution: NonNullable<SessionStateV4["execution"]>,
     pendingEvents: AttackChainPendingEvent[],
   ): DispatchResult {
     const timestamp = this.now();
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...reserved.state,
       phase: "active",
       execution,
@@ -1227,10 +1698,79 @@ class ApplicationSessionEngine implements SessionEngine {
     );
   }
 
+  private commitCheckpointProgress(
+    reserved: ReservedOperation,
+    nextState: SessionStateV4,
+    event: TimelineEvent,
+  ): ReservedOperation | null {
+    const timestamp = this.now();
+    const committed = this.database.transaction(() => {
+      const update = this.database
+        .prepare(
+          `update sessions
+           set state_json = ?, version = version + 1, updated_at = ?
+           where id = ? and operation_token = ?`,
+        )
+        .run(
+          JSON.stringify(nextState),
+          timestamp.getTime(),
+          reserved.sessionId,
+          reserved.operationToken,
+        );
+      if (update.changes !== 1) return false;
+      this.insertTimelineEvent(reserved.sessionId, event);
+      return true;
+    })();
+    return committed
+      ? {
+          sessionId: reserved.sessionId,
+          operationToken: reserved.operationToken,
+          state: nextState,
+          event,
+        }
+      : null;
+  }
+
+  private commitCheckpointSuccess(
+    command: Extract<SessionCommand, { type: "generate_checkpoint" }>,
+    reserved: ReservedOperation,
+    nextState: SessionStateV4,
+    events: TimelineEvent[],
+    finalEvent: TimelineEvent,
+  ): DispatchResult {
+    const timestamp = this.now();
+    const result = this.database.transaction((): DispatchResult | null => {
+      const update = this.database
+        .prepare(
+          `update sessions
+           set status = ?, state_json = ?, operation_token = null,
+               version = version + 1, updated_at = ?
+           where id = ? and operation_token = ?`,
+        )
+        .run(
+          nextState.phase,
+          JSON.stringify(nextState),
+          timestamp.getTime(),
+          command.sessionId,
+          reserved.operationToken,
+        );
+      if (update.changes !== 1) return null;
+      this.insertTimelineEvent(command.sessionId, finalEvent);
+      const applied: DispatchResult = {
+        status: "applied",
+        session: this.get(command.sessionId),
+        events,
+      };
+      this.insertIdempotency(command, timestamp, applied);
+      return applied;
+    })();
+    return result ?? this.operationConflict();
+  }
+
   private commitSynchronousCommand(
     command: Extract<SessionCommand, { type: "take_over" | "submit_human_answer" }>,
     session: InternalSession,
-    nextState: SessionStateV3,
+    nextState: SessionStateV4,
     pendingEvents: AttackChainPendingEvent[],
   ): DispatchResult {
     const timestamp = this.now();
@@ -1272,7 +1812,7 @@ class ApplicationSessionEngine implements SessionEngine {
       { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" }
     >,
     reserved: ReservedOperation,
-    nextState: SessionStateV3,
+    nextState: SessionStateV4,
     domainEvents: TimelineEvent[],
     timestamp: Date,
   ): DispatchResult {
@@ -1311,9 +1851,17 @@ class ApplicationSessionEngine implements SessionEngine {
   private commitOperationFailure(input: {
     command: Extract<
       SessionCommand,
-      { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" }
+      {
+        type:
+          | "generate_plan"
+          | "start"
+          | "request_ai_answer"
+          | "request_next_question"
+          | "generate_checkpoint";
+      }
     >;
     reserved: ReservedOperation;
+    stage?: CheckpointStage;
     code: string;
     retryable: boolean;
     generation: GenerationMetadata;
@@ -1324,6 +1872,7 @@ class ApplicationSessionEngine implements SessionEngine {
     const {
       command,
       reserved,
+      stage,
       code,
       retryable,
       generation,
@@ -1338,7 +1887,7 @@ class ApplicationSessionEngine implements SessionEngine {
       activeOperation.type,
       code,
     );
-    const nextState = sessionStateV3Schema.parse({
+    const nextState = sessionStateV4Schema.parse({
       ...reserved.state,
       phase: "error",
       activeOperation: null,
@@ -1352,6 +1901,7 @@ class ApplicationSessionEngine implements SessionEngine {
         rejectionCounts,
         lastRejectionReason,
         generation,
+        stage: stage ?? null,
       },
     });
     const event = parseTimelineEvent({
@@ -1365,12 +1915,18 @@ class ApplicationSessionEngine implements SessionEngine {
         usage: generation.usage,
         rejectionCounts,
         lastRejectionReason,
+        stage: stage ?? null,
       },
       createdAt: timestamp.toISOString(),
     });
     const result: DispatchResult = {
       status: "rejected",
-      error: { code, message: userMessage, retryable, details },
+      error: {
+        code,
+        message: userMessage,
+        retryable,
+        details: stage ? { ...details, stage } : details,
+      },
     };
     const committed = this.database.transaction(() => {
       const update = this.database
@@ -1417,7 +1973,13 @@ class ApplicationSessionEngine implements SessionEngine {
         active.type,
         "operation_interrupted",
       );
-      const nextState = sessionStateV3Schema.parse({
+      const checkpointStage =
+        active.type === "generate_checkpoint" &&
+        session.state.checkpoint &&
+        session.state.checkpoint.status !== "completed"
+          ? session.state.checkpoint.status
+          : null;
+      const nextState = sessionStateV4Schema.parse({
         ...session.state,
         phase: "error",
         activeOperation: null,
@@ -1430,7 +1992,10 @@ class ApplicationSessionEngine implements SessionEngine {
           retrySafety: "safe_to_retry",
           rejectionCounts: {},
           lastRejectionReason: null,
-          generation: emptyGeneration(contractVersionForOperation(session.state.policy, active.type)),
+          generation: emptyGeneration(
+            contractVersionForOperation(session.state.policy, active.type, checkpointStage),
+          ),
+          stage: checkpointStage,
         },
       });
       const event = parseTimelineEvent({
@@ -1444,9 +2009,24 @@ class ApplicationSessionEngine implements SessionEngine {
           usage: EMPTY_USAGE,
           rejectionCounts: {},
           lastRejectionReason: null,
+          stage: checkpointStage,
         },
         createdAt: timestamp.toISOString(),
       });
+      const interruptedCommand = {
+        type: active.type,
+        sessionId: row.id,
+        idempotencyKey: active.idempotencyKey,
+      } as Extract<SessionCommand, { type: SessionOperation }>;
+      const interruptedResult: DispatchResult = {
+        status: "rejected",
+        error: {
+          code: "operation_interrupted",
+          message: userMessage,
+          retryable: true,
+          details: checkpointStage ? { stage: checkpointStage } : undefined,
+        },
+      };
       this.database.transaction(() => {
         const update = this.database
           .prepare(
@@ -1454,7 +2034,10 @@ class ApplicationSessionEngine implements SessionEngine {
              version = version + 1, updated_at = ? where id = ? and operation_token = ?`,
           )
           .run(JSON.stringify(nextState), timestamp.getTime(), row.id, active.token);
-        if (update.changes === 1) this.insertTimelineEvent(row.id, event);
+        if (update.changes === 1) {
+          this.insertTimelineEvent(row.id, event);
+          this.insertIdempotency(interruptedCommand, timestamp, interruptedResult);
+        }
       })();
     }
   }
@@ -1481,7 +2064,12 @@ class ApplicationSessionEngine implements SessionEngine {
   }
 
   private actionUnavailable(
-    action: "request_ai_answer" | "request_next_question" | "take_over" | "submit_human_answer",
+    action:
+      | "request_ai_answer"
+      | "request_next_question"
+      | "generate_checkpoint"
+      | "take_over"
+      | "submit_human_answer",
     reason: ActionUnavailableReason,
   ): Extract<DispatchResult, { status: "rejected" }> {
     return {
@@ -1498,6 +2086,16 @@ class ApplicationSessionEngine implements SessionEngine {
     return {
       status: "rejected",
       error: { code: "session_busy", message: `Cannot ${action} while another operation is active` },
+    };
+  }
+
+  private operationConflict(): DispatchResult {
+    return {
+      status: "rejected",
+      error: {
+        code: "operation_conflict",
+        message: "Session changed before operation commit",
+      },
     };
   }
 
