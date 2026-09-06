@@ -83,7 +83,7 @@
 
 - 验收 session 至少能展示一次 A2A candidate answer，再在后续已展示问题上 `Take Over` 并提交 human answer。
 - `Take Over` 在问题展示前、问题已结算后或 model operation 进行中均被 typed state error 拒绝。
-- `Interviewer`、`Candidate`、`Judge` 的实际组装输入符合角色隔离测试；`Interviewer` payload 不含隐藏 Judge 字段。
+- `Interviewer` 与 `Candidate` 的实际组装输入符合角色隔离测试；`Interviewer` payload 不含隐藏 Judge 字段，`Candidate` payload 仅含本步骤允许的 bounded context。
 - 所有用户可见问题/回答只追加一次 timeline，刷新或 SSE reconnect 不重复。
 - 此路径没有 direct-A2H、`Auto` 或 `Hand Back` 控件与命令入口。
 
@@ -94,6 +94,7 @@
 **完成标准**：
 
 - Judge evaluation 在接收 `Benchmark` 前生成并持久化 rubric result；后续解释不能覆写它。
+- `Judge` 实际输入组装与角色隔离由本步骤验收，不以前一步尚未存在的 operation 做静态占位验收。
 - 链末一个 batch operation 为每个 human answer 返回证据约束的 `Benchmark`，数量与顺序精确对应。
 - 默认视图先展示差异与证据，完整 `Benchmark` 可折叠展开。
 - 每个 finding 初始 calibration 为 `unreviewed`，数量为 0–3，并带目标维度、依据和优先级。

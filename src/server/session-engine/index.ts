@@ -3,10 +3,15 @@ import { createHash, randomUUID } from "node:crypto";
 
 import {
   acceptNextQuestionCandidate,
+  completeAtPlannedDepth,
   createAttackChainExecutionState,
+  settleQuestionTurn,
+  takeOverQuestionTurn,
+  type AttackChainPendingEvent,
   type QuestionSemanticRejectionReason,
 } from "@/server/core-loop/attack-chain-execution";
 import {
+  answerTextSchema,
   generationMetadataSchema,
   type GenerationMetadata,
   type GenerationUsage,
@@ -20,10 +25,10 @@ import {
   type PlanningInputSizes,
 } from "@/server/core-loop/grounding";
 import {
-  CORE_LOOP_V1_POLICY,
+  CORE_LOOP_V2_POLICY,
   createCoreLoopPolicySnapshot,
 } from "@/server/core-loop/policy";
-import type { InterviewAgents } from "@/server/interview-agents";
+import type { InterviewAgents, PublicTranscriptTurn } from "@/server/interview-agents";
 import {
   ProfileNotFoundError,
   ProviderViewNotConfirmedError,
@@ -32,11 +37,11 @@ import {
 } from "@/server/preparation-profiles";
 import {
   projectSessionState,
-  sessionStateV2Schema,
+  sessionStateV3Schema,
   type PublicSessionState,
   type SessionOperation,
   type SessionPhase,
-  type SessionStateV2,
+  type SessionStateV3,
 } from "./state";
 import {
   parseTimelineEvent,
@@ -47,6 +52,15 @@ export type { TimelineEvent } from "./timeline";
 export type { PublicSessionState } from "./state";
 
 export type SessionStatus = SessionPhase;
+
+export class SessionNotFoundError extends Error {
+  readonly code = "session_not_found";
+
+  constructor(readonly sessionId: string) {
+    super(`Session not found: ${sessionId}`);
+    this.name = "SessionNotFoundError";
+  }
+}
 
 export interface SessionView {
   id: string;
@@ -68,7 +82,27 @@ export type SessionCommand =
       idempotencyKey: string;
     }
   | { type: "generate_plan"; sessionId: string; idempotencyKey: string }
-  | { type: "start"; sessionId: string; idempotencyKey: string };
+  | { type: "start"; sessionId: string; idempotencyKey: string }
+  | { type: "request_ai_answer"; sessionId: string; idempotencyKey: string }
+  | { type: "request_next_question"; sessionId: string; idempotencyKey: string }
+  | { type: "take_over"; sessionId: string; idempotencyKey: string }
+  | {
+      type: "submit_human_answer";
+      sessionId: string;
+      answer: string;
+      idempotencyKey: string;
+    };
+
+export type ActionUnavailableReason =
+  | "session_not_active"
+  | "session_in_error"
+  | "no_pending_question"
+  | "question_already_settled"
+  | "answer_pending"
+  | "attack_chain_completed"
+  | "candidate_control_required"
+  | "human_control_required"
+  | "human_already_controls";
 
 export interface SessionCommandError {
   code: string;
@@ -78,6 +112,7 @@ export interface SessionCommandError {
     fieldSizes?: PlanningInputSizes;
     rejectionCounts?: Record<string, number>;
     lastRejectionReason?: string | null;
+    reason?: ActionUnavailableReason | "empty" | "too_long";
   };
 }
 
@@ -117,12 +152,12 @@ interface SessionRow {
 interface InternalSession {
   row: SessionRow;
   profileSnapshot: ProfileSnapshot;
-  state: SessionStateV2;
+  state: SessionStateV3;
 }
 
 interface ReservedOperation {
   operationToken: string;
-  state: SessionStateV2;
+  state: SessionStateV3;
   event: TimelineEvent;
 }
 
@@ -134,15 +169,20 @@ const EMPTY_USAGE: GenerationUsage = {
 };
 
 function commandFingerprint(command: SessionCommand): string {
-  const payload =
-    command.type === "create_session"
-      ? {
-          type: command.type,
-          sessionId: command.sessionId,
-          profileId: command.profileId,
-          interviewLanguage: command.interviewLanguage,
-        }
-      : { type: command.type, sessionId: command.sessionId };
+  const payload = (() => {
+    if (command.type === "create_session") {
+      return {
+        type: command.type,
+        sessionId: command.sessionId,
+        profileId: command.profileId,
+        interviewLanguage: command.interviewLanguage,
+      };
+    }
+    if (command.type === "submit_human_answer") {
+      return { type: command.type, sessionId: command.sessionId, answer: command.answer.trim() };
+    }
+    return { type: command.type, sessionId: command.sessionId };
+  })();
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex");
 }
 
@@ -188,37 +228,61 @@ function incrementCount(counts: Record<string, number>, reason: string): void {
   counts[reason] = (counts[reason] ?? 0) + 1;
 }
 
+function settledPublicTranscript(
+  execution: NonNullable<SessionStateV3["execution"]>,
+): PublicTranscriptTurn[] {
+  return execution.turns
+    .filter((turn) => turn.status === "settled" && turn.answer)
+    .map((turn) => ({
+      question: turn.question.text,
+      answer: turn.answer ? { actor: turn.answer.actor, text: turn.answer.text } : null,
+    }));
+}
+
+function contractVersionForOperation(
+  policy: SessionStateV3["policy"],
+  operation: SessionOperation,
+): GenerationMetadata["contractVersion"] {
+  if (operation === "generate_plan") return policy.plannerContractVersion;
+  if (operation === "request_ai_answer") return policy.candidateAnswerContractVersion;
+  return policy.questionContractVersion;
+}
+
 function localizedFailureMessage(
   language: InterviewLanguage,
   operation: SessionOperation,
   code: string,
 ): string {
+  const operationLabel = (() => {
+    if (operation === "generate_plan") return language === "zh-CN" ? "面试计划" : "interview plan";
+    if (operation === "start") return language === "zh-CN" ? "首个问题" : "first question";
+    if (operation === "request_ai_answer") {
+      return language === "zh-CN" ? "Candidate 回答" : "Candidate answer";
+    }
+    return language === "zh-CN" ? "下一问题" : "next question";
+  })();
   if (language === "zh-CN") {
     if (code === "input_too_large") return "准备资料超过本版本可处理的长度，请缩短后创建新 Session。";
     if (code === "semantic_candidates_exhausted") {
       return operation === "generate_plan"
-        ? "模型未能生成可验证的面试计划，请重试或补充更具体的资料。"
-        : "模型未能生成有效且不重复的问题，请重试。";
+        ? "模型未能生成可验证的面试计划，请补充更具体的资料。"
+        : `模型未能生成有效的${operationLabel}。`;
     }
-    if (code === "operation_interrupted") return "上一次模型操作被中断，可以安全重试。";
-    return operation === "generate_plan"
-      ? "面试计划生成失败，请检查模型配置后重试。"
-      : "首个问题生成失败，请检查模型配置后重试。";
+    if (code === "operation_interrupted") return `上一次${operationLabel}操作被中断。`;
+    return `${operationLabel}生成失败，请检查模型配置。`;
   }
   if (code === "input_too_large") {
     return "The preparation material exceeds this version's limit. Shorten it and create a new Session.";
   }
   if (code === "semantic_candidates_exhausted") {
     return operation === "generate_plan"
-      ? "The model did not produce a verifiable interview plan. Retry or add more concrete evidence."
-      : "The model did not produce a valid, non-duplicate question. Please retry.";
+      ? "The model did not produce a verifiable interview plan. Add more concrete evidence."
+      : `The model did not produce a valid ${operationLabel}.`;
   }
   if (code === "operation_interrupted") {
-    return "The previous model operation was interrupted and can be retried safely.";
+    return `The previous ${operationLabel} operation was interrupted.`;
   }
-  return operation === "generate_plan"
-    ? "Interview plan generation failed. Check the model configuration and retry."
-    : "First-question generation failed. Check the model configuration and retry.";
+  return `${operationLabel} generation failed. Check the model configuration.`;
 }
 
 function mapSession(session: InternalSession): SessionView {
@@ -257,7 +321,11 @@ class ApplicationSessionEngine implements SessionEngine {
   async dispatch(command: SessionCommand): Promise<DispatchResult> {
     if (command.type === "create_session") return this.createSession(command);
     if (command.type === "generate_plan") return this.generatePlan(command);
-    return this.startSession(command);
+    if (command.type === "start") return this.startSession(command);
+    if (command.type === "request_ai_answer") return this.requestAiAnswer(command);
+    if (command.type === "request_next_question") return this.requestNextQuestion(command);
+    if (command.type === "take_over") return this.takeOver(command);
+    return this.submitHumanAnswer(command);
   }
 
   get(sessionId: string): SessionView {
@@ -310,7 +378,7 @@ class ApplicationSessionEngine implements SessionEngine {
          from sessions where id = ?`,
       )
       .get(sessionId) as SessionRow | undefined;
-    if (!row) throw new Error(`Session not found: ${sessionId}`);
+    if (!row) throw new SessionNotFoundError(sessionId);
     return this.parseInternal(row);
   }
 
@@ -318,7 +386,7 @@ class ApplicationSessionEngine implements SessionEngine {
     return {
       row,
       profileSnapshot: JSON.parse(row.profile_snapshot_json) as ProfileSnapshot,
-      state: sessionStateV2Schema.parse(JSON.parse(row.state_json) as unknown),
+      state: sessionStateV3Schema.parse(JSON.parse(row.state_json) as unknown),
     };
   }
 
@@ -349,8 +417,8 @@ class ApplicationSessionEngine implements SessionEngine {
     }
 
     const timestamp = this.now();
-    const state = sessionStateV2Schema.parse({
-      stateVersion: 2,
+    const state = sessionStateV3Schema.parse({
+      stateVersion: 3,
       phase: "draft",
       interviewLanguage: command.interviewLanguage,
       policy: createCoreLoopPolicySnapshot(),
@@ -530,10 +598,7 @@ class ApplicationSessionEngine implements SessionEngine {
         jobDescription: session.profileSnapshot.providerView.jobDescription,
         targetRole: session.profileSnapshot.providerView.targetRole,
         targetLevel: session.profileSnapshot.providerView.targetLevel,
-        publicTranscript: initialExecution.turns.map((turn) => ({
-          question: turn.question.text,
-          answer: turn.answer,
-        })),
+        publicTranscript: settledPublicTranscript(initialExecution),
         currentDifficulty: initialExecution.turns.at(-1)?.question.difficulty ?? null,
         remainingDepth: chain.estimatedDepth - initialExecution.turns.length,
         semanticRejections,
@@ -580,6 +645,384 @@ class ApplicationSessionEngine implements SessionEngine {
     });
   }
 
+  private async requestAiAnswer(
+    command: Extract<SessionCommand, { type: "request_ai_answer" }>,
+  ): Promise<DispatchResult> {
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) return idempotencyResult;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token || session.state.activeOperation) {
+      return this.sessionBusy("request a Candidate answer");
+    }
+    if (session.state.phase !== "active") {
+      const reason = session.state.phase === "error" ? "session_in_error" : "session_not_active";
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_ai_answer", reason),
+      );
+    }
+    const execution = session.state.execution;
+    if (!execution || !session.state.planRecord?.questionContext) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_ai_answer", "no_pending_question"),
+      );
+    }
+    const activeTurn = execution.turns.at(-1);
+    if (execution.status === "completed") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_ai_answer", "attack_chain_completed"),
+      );
+    }
+    if (execution.status !== "awaiting_answer" || !activeTurn || activeTurn.status !== "awaiting_answer") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_ai_answer", "question_already_settled"),
+      );
+    }
+    if (execution.answerMode !== "a2a") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_ai_answer", "candidate_control_required"),
+      );
+    }
+
+    const reserved = this.reserveOperation(command.sessionId, session, "request_ai_answer");
+    if (!reserved) return this.sessionBusy("request a Candidate answer");
+    const candidate = await this.safeCandidateAnswer({
+      operationToken: reserved.operationToken,
+      interviewLanguage: reserved.state.interviewLanguage,
+      questionContext: session.state.planRecord.questionContext,
+      jobDescription: session.profileSnapshot.providerView.jobDescription,
+      targetRole: session.profileSnapshot.providerView.targetRole,
+      targetLevel: session.profileSnapshot.providerView.targetLevel,
+      currentQuestion: activeTurn.question.text,
+      publicTranscript: settledPublicTranscript(execution),
+    });
+    if (candidate.status === "failure") {
+      return this.commitOperationFailure({
+        command,
+        reserved,
+        code: candidate.code,
+        retryable: candidate.retryable,
+        generation: candidate.generation,
+        rejectionCounts: {},
+        lastRejectionReason: null,
+      });
+    }
+    const settled = settleQuestionTurn({
+      state: reserved.state.execution!,
+      questionTurnId: activeTurn.id,
+      actor: "candidate",
+      answer: candidate.value.text,
+      generation: candidate.generation,
+      now: this.now().toISOString(),
+    });
+    if (settled.status === "rejected") {
+      return this.commitOperationFailure({
+        command,
+        reserved,
+        code: "candidate_answer_rejected",
+        retryable: false,
+        generation: candidate.generation,
+        rejectionCounts: { [settled.reason]: 1 },
+        lastRejectionReason: settled.reason,
+      });
+    }
+    const chain = session.state.planRecord.plan.attackChains[0];
+    if (chain.status !== "ready") {
+      return this.commitOperationFailure({
+        command,
+        reserved,
+        code: "attack_chain_not_ready",
+        retryable: false,
+        generation: candidate.generation,
+        rejectionCounts: {},
+        lastRejectionReason: null,
+      });
+    }
+    const completion = completeAtPlannedDepth({
+      state: settled.state,
+      chain,
+      policy: reserved.state.policy,
+      interviewLanguage: reserved.state.interviewLanguage,
+      now: this.now().toISOString(),
+    });
+    const executionAfterAnswer = completion?.status === "accepted" ? completion.state : settled.state;
+    const pendingEvents = [
+      ...settled.events,
+      ...(completion?.status === "accepted" ? completion.events : []),
+    ];
+    return this.commitCoreLoopOperation(command, reserved, executionAfterAnswer, pendingEvents);
+  }
+
+  private async requestNextQuestion(
+    command: Extract<SessionCommand, { type: "request_next_question" }>,
+  ): Promise<DispatchResult> {
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) return idempotencyResult;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token || session.state.activeOperation) {
+      return this.sessionBusy("request the next question");
+    }
+    if (session.state.phase !== "active") {
+      const reason = session.state.phase === "error" ? "session_in_error" : "session_not_active";
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_next_question", reason),
+      );
+    }
+    const execution = session.state.execution;
+    const record = session.state.planRecord;
+    if (!execution || !record?.questionContext) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_next_question", "session_not_active"),
+      );
+    }
+    if (execution.status === "completed") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_next_question", "attack_chain_completed"),
+      );
+    }
+    if (execution.status !== "ready_for_next_question") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_next_question", "answer_pending"),
+      );
+    }
+    const chain = record.plan.attackChains[0];
+    if (chain.status !== "ready") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("request_next_question", "session_not_active"),
+      );
+    }
+
+    const reserved = this.reserveOperation(command.sessionId, session, "request_next_question");
+    if (!reserved) return this.sessionBusy("request the next question");
+    let generation = emptyGeneration(reserved.state.policy.questionContractVersion);
+    const rejectionCounts: Record<string, number> = {};
+    const semanticRejections: string[] = [];
+    let lastReason: QuestionSemanticRejectionReason | null = null;
+    for (
+      let candidateNumber = 1;
+      candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
+      candidateNumber += 1
+    ) {
+      const candidate = await this.safeQuestionCandidate({
+        operationToken: reserved.operationToken,
+        interviewLanguage: reserved.state.interviewLanguage,
+        plan: record.plan,
+        questionContext: record.questionContext,
+        jobDescription: session.profileSnapshot.providerView.jobDescription,
+        targetRole: session.profileSnapshot.providerView.targetRole,
+        targetLevel: session.profileSnapshot.providerView.targetLevel,
+        publicTranscript: settledPublicTranscript(execution),
+        currentDifficulty: execution.turns.at(-1)?.question.difficulty ?? null,
+        remainingDepth: chain.estimatedDepth - execution.turns.length,
+        semanticRejections,
+      });
+      generation = mergeGeneration(generation, candidate.generation);
+      if (candidate.status === "failure") {
+        return this.commitOperationFailure({
+          command,
+          reserved,
+          code: candidate.code,
+          retryable: candidate.retryable,
+          generation,
+          rejectionCounts,
+          lastRejectionReason: lastReason,
+        });
+      }
+      const transition = acceptNextQuestionCandidate({
+        state: reserved.state.execution!,
+        chain,
+        candidate: candidate.value,
+        generation,
+        policy: reserved.state.policy,
+        questionTurnId: this.createEntityId(),
+        now: this.now().toISOString(),
+      });
+      if (transition.status === "rejected") {
+        lastReason = transition.reason;
+        incrementCount(rejectionCounts, transition.reason);
+        semanticRejections.push(transition.reason);
+        continue;
+      }
+      return this.commitCoreLoopOperation(command, reserved, transition.state, transition.events);
+    }
+    return this.commitOperationFailure({
+      command,
+      reserved,
+      code: "semantic_candidates_exhausted",
+      retryable: true,
+      generation,
+      rejectionCounts,
+      lastRejectionReason: lastReason,
+      details: { rejectionCounts, lastRejectionReason: lastReason },
+    });
+  }
+
+  private takeOver(
+    command: Extract<SessionCommand, { type: "take_over" }>,
+  ): DispatchResult {
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) return idempotencyResult;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token || session.state.activeOperation) {
+      return this.sessionBusy("Take Over");
+    }
+    const recoverableCandidateFailure =
+      session.state.phase === "error" &&
+      session.state.failedOperation?.type === "request_ai_answer";
+    if (session.state.phase !== "active" && !recoverableCandidateFailure) {
+      const reason = session.state.phase === "error" ? "session_in_error" : "session_not_active";
+      return this.commitRejection(command, this.actionUnavailable("take_over", reason));
+    }
+    const execution = session.state.execution;
+    if (!execution) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("take_over", "no_pending_question"),
+      );
+    }
+    if (execution.status === "completed") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("take_over", "attack_chain_completed"),
+      );
+    }
+    if (execution.status !== "awaiting_answer") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("take_over", "question_already_settled"),
+      );
+    }
+    if (execution.answerMode === "a2h") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("take_over", "human_already_controls"),
+      );
+    }
+    const transition = takeOverQuestionTurn(execution);
+    if (transition.status === "rejected") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("take_over", "no_pending_question"),
+      );
+    }
+    const nextState = sessionStateV3Schema.parse({
+      ...session.state,
+      phase: "active",
+      execution: transition.state,
+      activeOperation: null,
+      failedOperation: null,
+    });
+    return this.commitSynchronousCommand(command, session, nextState, transition.events);
+  }
+
+  private submitHumanAnswer(
+    command: Extract<SessionCommand, { type: "submit_human_answer" }>,
+  ): DispatchResult {
+    const idempotencyResult = this.findIdempotencyResult(command);
+    if (idempotencyResult) return idempotencyResult;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token || session.state.activeOperation) {
+      return this.sessionBusy("submit a human answer");
+    }
+    const parsedAnswer = answerTextSchema.safeParse(command.answer);
+    if (!parsedAnswer.success) {
+      const reason = command.answer.trim() ? "too_long" : "empty";
+      return this.commitRejection(command, {
+        status: "rejected",
+        error: {
+          code: "invalid_human_answer",
+          message: `Human answer must contain 1-${CORE_LOOP_V2_POLICY.textLimits.answer} Unicode characters`,
+          details: { reason },
+        },
+      });
+    }
+    if (session.state.phase !== "active") {
+      const reason = session.state.phase === "error" ? "session_in_error" : "session_not_active";
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", reason),
+      );
+    }
+    const execution = session.state.execution;
+    if (!execution) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "no_pending_question"),
+      );
+    }
+    if (execution.status === "completed") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "attack_chain_completed"),
+      );
+    }
+    const activeTurn = execution.turns.at(-1);
+    if (execution.status !== "awaiting_answer" || !activeTurn) {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "question_already_settled"),
+      );
+    }
+    if (execution.answerMode !== "a2h") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "human_control_required"),
+      );
+    }
+    const settled = settleQuestionTurn({
+      state: execution,
+      questionTurnId: activeTurn.id,
+      actor: "human",
+      answer: parsedAnswer.data,
+      now: this.now().toISOString(),
+    });
+    if (settled.status === "rejected") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "no_pending_question"),
+      );
+    }
+    const chain = session.state.planRecord?.plan.attackChains[0];
+    if (!chain || chain.status !== "ready") {
+      return this.commitRejection(
+        command,
+        this.actionUnavailable("submit_human_answer", "session_not_active"),
+      );
+    }
+    const completion = completeAtPlannedDepth({
+      state: settled.state,
+      chain,
+      policy: session.state.policy,
+      interviewLanguage: session.state.interviewLanguage,
+      now: this.now().toISOString(),
+    });
+    const executionAfterAnswer = completion?.status === "accepted" ? completion.state : settled.state;
+    const pendingEvents = [
+      ...settled.events,
+      ...(completion?.status === "accepted" ? completion.events : []),
+    ];
+    const nextState = sessionStateV3Schema.parse({
+      ...session.state,
+      execution: executionAfterAnswer,
+      activeOperation: null,
+      failedOperation: null,
+    });
+    return this.commitSynchronousCommand(command, session, nextState, pendingEvents);
+  }
+
   private async safePlanCandidate(
     input: Parameters<InterviewAgents["planSingleAttackChain"]>[0],
   ): ReturnType<InterviewAgents["planSingleAttackChain"]> {
@@ -591,7 +1034,7 @@ class ApplicationSessionEngine implements SessionEngine {
         code: "agent_unexpected_error",
         message: "Unexpected InterviewAgents failure",
         retryable: false,
-        generation: emptyGeneration(CORE_LOOP_V1_POLICY.plannerContractVersion),
+        generation: emptyGeneration(CORE_LOOP_V2_POLICY.plannerContractVersion),
       };
     }
   }
@@ -607,7 +1050,23 @@ class ApplicationSessionEngine implements SessionEngine {
         code: "agent_unexpected_error",
         message: "Unexpected InterviewAgents failure",
         retryable: false,
-        generation: emptyGeneration(CORE_LOOP_V1_POLICY.questionContractVersion),
+        generation: emptyGeneration(CORE_LOOP_V2_POLICY.questionContractVersion),
+      };
+    }
+  }
+
+  private async safeCandidateAnswer(
+    input: Parameters<InterviewAgents["generateCandidateAnswer"]>[0],
+  ): ReturnType<InterviewAgents["generateCandidateAnswer"]> {
+    try {
+      return await this.interviewAgents.generateCandidateAnswer(input);
+    } catch {
+      return {
+        status: "failure",
+        code: "agent_unexpected_error",
+        message: "Unexpected InterviewAgents failure",
+        retryable: false,
+        generation: emptyGeneration(CORE_LOOP_V2_POLICY.candidateAnswerContractVersion),
       };
     }
   }
@@ -619,7 +1078,7 @@ class ApplicationSessionEngine implements SessionEngine {
   ): ReservedOperation | null {
     const operationToken = this.createOperationToken();
     const timestamp = this.now();
-    const nextState = sessionStateV2Schema.parse({
+    const nextState = sessionStateV3Schema.parse({
       ...session.state,
       activeOperation: {
         type: operation,
@@ -658,11 +1117,11 @@ class ApplicationSessionEngine implements SessionEngine {
   private commitPlan(
     command: Extract<SessionCommand, { type: "generate_plan" }>,
     reserved: ReservedOperation,
-    record: NonNullable<SessionStateV2["planRecord"]>,
+    record: NonNullable<SessionStateV3["planRecord"]>,
   ): DispatchResult {
     const timestamp = this.now();
     const chain = record.plan.attackChains[0];
-    const nextState = sessionStateV2Schema.parse({
+    const nextState = sessionStateV3Schema.parse({
       ...reserved.state,
       phase: "planned",
       planRecord: record,
@@ -683,11 +1142,11 @@ class ApplicationSessionEngine implements SessionEngine {
     command: Extract<SessionCommand, { type: "start" }>,
     reserved: ReservedOperation,
     chain: ReadyAttackChain,
-    execution: NonNullable<SessionStateV2["execution"]>,
+    execution: NonNullable<SessionStateV3["execution"]>,
     generation: GenerationMetadata,
   ): DispatchResult {
     const timestamp = this.now();
-    const nextState = sessionStateV2Schema.parse({
+    const nextState = sessionStateV3Schema.parse({
       ...reserved.state,
       phase: "active",
       execution,
@@ -728,10 +1187,92 @@ class ApplicationSessionEngine implements SessionEngine {
     );
   }
 
-  private commitSuccessfulOperation(
-    command: Extract<SessionCommand, { type: "generate_plan" | "start" }>,
+  private commitCoreLoopOperation(
+    command: Extract<
+      SessionCommand,
+      { type: "request_ai_answer" | "request_next_question" }
+    >,
     reserved: ReservedOperation,
-    nextState: SessionStateV2,
+    execution: NonNullable<SessionStateV3["execution"]>,
+    pendingEvents: AttackChainPendingEvent[],
+  ): DispatchResult {
+    const timestamp = this.now();
+    const nextState = sessionStateV3Schema.parse({
+      ...reserved.state,
+      phase: "active",
+      execution,
+      activeOperation: null,
+      failedOperation: null,
+    });
+    const events = this.materializePendingEvents(
+      reserved.event.sequence + 1,
+      pendingEvents,
+      timestamp,
+    );
+    return this.commitSuccessfulOperation(command, reserved, nextState, events, timestamp);
+  }
+
+  private materializePendingEvents(
+    firstSequence: number,
+    pendingEvents: AttackChainPendingEvent[],
+    timestamp: Date,
+  ): TimelineEvent[] {
+    return pendingEvents.map((event, index) =>
+      parseTimelineEvent({
+        sequence: firstSequence + index,
+        type: event.type,
+        payload: event.payload,
+        createdAt: timestamp.toISOString(),
+      }),
+    );
+  }
+
+  private commitSynchronousCommand(
+    command: Extract<SessionCommand, { type: "take_over" | "submit_human_answer" }>,
+    session: InternalSession,
+    nextState: SessionStateV3,
+    pendingEvents: AttackChainPendingEvent[],
+  ): DispatchResult {
+    const timestamp = this.now();
+    const events = this.materializePendingEvents(
+      this.nextSequence(command.sessionId),
+      pendingEvents,
+      timestamp,
+    );
+    const result = this.database.transaction((): DispatchResult | null => {
+      const update = this.database
+        .prepare(
+          `update sessions
+           set status = ?, state_json = ?, version = version + 1, updated_at = ?
+           where id = ? and version = ? and operation_token is null`,
+        )
+        .run(
+          nextState.phase,
+          JSON.stringify(nextState),
+          timestamp.getTime(),
+          command.sessionId,
+          session.row.version,
+        );
+      if (update.changes !== 1) return null;
+      for (const event of events) this.insertTimelineEvent(command.sessionId, event);
+      const applied: DispatchResult = {
+        status: "applied",
+        session: this.get(command.sessionId),
+        events,
+      };
+      this.insertIdempotency(command, timestamp, applied);
+      return applied;
+    })();
+    return result ?? this.sessionBusy(command.type);
+  }
+
+  private commitSuccessfulOperation(
+    command: Extract<
+      SessionCommand,
+      { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" }
+    >,
+    reserved: ReservedOperation,
+    nextState: SessionStateV3,
     domainEvents: TimelineEvent[],
     timestamp: Date,
   ): DispatchResult {
@@ -768,7 +1309,10 @@ class ApplicationSessionEngine implements SessionEngine {
   }
 
   private commitOperationFailure(input: {
-    command: Extract<SessionCommand, { type: "generate_plan" | "start" }>;
+    command: Extract<
+      SessionCommand,
+      { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" }
+    >;
     reserved: ReservedOperation;
     code: string;
     retryable: boolean;
@@ -794,7 +1338,7 @@ class ApplicationSessionEngine implements SessionEngine {
       activeOperation.type,
       code,
     );
-    const nextState = sessionStateV2Schema.parse({
+    const nextState = sessionStateV3Schema.parse({
       ...reserved.state,
       phase: "error",
       activeOperation: null,
@@ -873,7 +1417,7 @@ class ApplicationSessionEngine implements SessionEngine {
         active.type,
         "operation_interrupted",
       );
-      const nextState = sessionStateV2Schema.parse({
+      const nextState = sessionStateV3Schema.parse({
         ...session.state,
         phase: "error",
         activeOperation: null,
@@ -886,11 +1430,7 @@ class ApplicationSessionEngine implements SessionEngine {
           retrySafety: "safe_to_retry",
           rejectionCounts: {},
           lastRejectionReason: null,
-          generation: emptyGeneration(
-            active.type === "generate_plan"
-              ? session.state.policy.plannerContractVersion
-              : session.state.policy.questionContractVersion,
-          ),
+          generation: emptyGeneration(contractVersionForOperation(session.state.policy, active.type)),
         },
       });
       const event = parseTimelineEvent({
@@ -924,7 +1464,8 @@ class ApplicationSessionEngine implements SessionEngine {
   ): InternalSession | Extract<DispatchResult, { status: "rejected" }> {
     try {
       return this.getInternal(command.sessionId);
-    } catch {
+    } catch (error) {
+      if (!(error instanceof SessionNotFoundError)) throw error;
       return this.commitRejection(command, {
         status: "rejected",
         error: { code: "session_not_found", message: `Session not found: ${command.sessionId}` },
@@ -936,6 +1477,20 @@ class ApplicationSessionEngine implements SessionEngine {
     return {
       status: "rejected",
       error: { code: "invalid_session_state", message: `Cannot ${action} while Session is ${phase}` },
+    };
+  }
+
+  private actionUnavailable(
+    action: "request_ai_answer" | "request_next_question" | "take_over" | "submit_human_answer",
+    reason: ActionUnavailableReason,
+  ): Extract<DispatchResult, { status: "rejected" }> {
+    return {
+      status: "rejected",
+      error: {
+        code: `${action}_not_available`,
+        message: `${action} is not available: ${reason}`,
+        details: { reason },
+      },
     };
   }
 

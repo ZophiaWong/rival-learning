@@ -1,10 +1,11 @@
 import { z } from "zod";
 
 export const coreLoopPolicySchema = z.strictObject({
-  version: z.literal("core-loop-v1"),
+  version: z.literal("core-loop-v2"),
   chainPolicyVersion: z.literal("attack-chain-v1"),
   plannerContractVersion: z.literal("interview-plan-v1"),
   questionContractVersion: z.literal("interviewer-question-v1"),
+  candidateAnswerContractVersion: z.literal("candidate-answer-v1"),
   questionNormalizerVersion: z.literal("question-v1"),
   maxQuestionTurns: z.literal(4),
   maxEvidenceAnchors: z.literal(3),
@@ -19,40 +20,43 @@ export const coreLoopPolicySchema = z.strictObject({
     difficultyExplanation: z.literal(300),
     requestedEvidencePrompt: z.literal(300),
     question: z.literal(1_000),
+    answer: z.literal(4_000),
     completionExplanation: z.literal(300),
   }),
 });
 
 export type CoreLoopPolicy = z.infer<typeof coreLoopPolicySchema>;
 
-const parsedCoreLoopV1Policy = coreLoopPolicySchema.parse({
-    version: "core-loop-v1",
-    chainPolicyVersion: "attack-chain-v1",
-    plannerContractVersion: "interview-plan-v1",
-    questionContractVersion: "interviewer-question-v1",
-    questionNormalizerVersion: "question-v1",
-    maxQuestionTurns: 4,
-    maxEvidenceAnchors: 3,
-    maxEvidenceAnchorLines: 5,
-    maxRequestedEvidenceItems: 3,
-    maxSemanticCandidatesPerOperation: 3,
-    maxQuestionContextLines: 24,
-    maxQuestionContextChars: 4_000,
-    maxPlanningInputChars: 24_000,
-    textLimits: {
-      knowledgeTarget: 300,
-      difficultyExplanation: 300,
-      requestedEvidencePrompt: 300,
-      question: 1_000,
-      completionExplanation: 300,
-    },
-  });
+const parsedCoreLoopV2Policy = coreLoopPolicySchema.parse({
+  version: "core-loop-v2",
+  chainPolicyVersion: "attack-chain-v1",
+  plannerContractVersion: "interview-plan-v1",
+  questionContractVersion: "interviewer-question-v1",
+  candidateAnswerContractVersion: "candidate-answer-v1",
+  questionNormalizerVersion: "question-v1",
+  maxQuestionTurns: 4,
+  maxEvidenceAnchors: 3,
+  maxEvidenceAnchorLines: 5,
+  maxRequestedEvidenceItems: 3,
+  maxSemanticCandidatesPerOperation: 3,
+  maxQuestionContextLines: 24,
+  maxQuestionContextChars: 4_000,
+  maxPlanningInputChars: 24_000,
+  textLimits: {
+    knowledgeTarget: 300,
+    difficultyExplanation: 300,
+    requestedEvidencePrompt: 300,
+    question: 1_000,
+    answer: 4_000,
+    completionExplanation: 300,
+  },
+});
 
-Object.freeze(parsedCoreLoopV1Policy.textLimits);
-export const CORE_LOOP_V1_POLICY: Readonly<CoreLoopPolicy> = Object.freeze(
-  parsedCoreLoopV1Policy,
+Object.freeze(parsedCoreLoopV2Policy.textLimits);
+export const CORE_LOOP_V2_POLICY: Readonly<CoreLoopPolicy> = Object.freeze(
+  parsedCoreLoopV2Policy,
 );
 
 export function createCoreLoopPolicySnapshot(): CoreLoopPolicy {
-  return coreLoopPolicySchema.parse(CORE_LOOP_V1_POLICY);
+  return coreLoopPolicySchema.parse(CORE_LOOP_V2_POLICY);
 }

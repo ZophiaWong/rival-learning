@@ -187,7 +187,12 @@ describe("InterviewAgents Interface", () => {
       jobDescription: providerView.jobDescription,
       targetRole: providerView.targetRole,
       targetLevel: providerView.targetLevel,
-      publicTranscript: [],
+      publicTranscript: [
+        {
+          question: "What scope did you own?",
+          answer: { actor: "candidate", text: "I owned the migration boundary." },
+        },
+      ],
       currentDifficulty: null,
       remainingDepth: 3,
       semanticRejections: [],
@@ -196,8 +201,127 @@ describe("InterviewAgents Interface", () => {
     const payload = JSON.parse(captured!.input) as Record<string, unknown>;
     expect(payload).toHaveProperty("evidenceContext");
     expect(payload).toHaveProperty("hiringBar");
+    expect(payload).toHaveProperty("publicTranscript", [
+      {
+        question: "What scope did you own?",
+        answer: { actor: "candidate", text: "I owned the migration boundary." },
+      },
+    ]);
     expect(payload).not.toHaveProperty("providerView");
     expect(captured!.input).not.toContain(providerView.projectNotes);
     expect(captured?.onOutputDelta).toBeUndefined();
+  });
+
+  it("assembles a bounded Candidate payload with an independent role and contract", async () => {
+    let captured: RoleRunRequest<unknown> | undefined;
+    const agents = createInterviewAgents(
+      new ScriptedRoleRunner([
+        (request) => {
+          captured = request;
+          return {
+            status: "success",
+            value: {
+              outcome: {
+                text: "I chose idempotent retries; the supplied evidence does not establish the wider team split.",
+              },
+            },
+          };
+        },
+      ]),
+    );
+    const result = await agents.generateCandidateAnswer({
+      operationToken: "OPERATION_TOKEN_CANARY",
+      interviewLanguage: "en-US",
+      questionContext: {
+        lines: [
+          {
+            source: "resume",
+            lineNumber: 1,
+            text: providerView.resume,
+            evidenceAnchorIds: ["anchor-1"],
+          },
+        ],
+        totalLines: 1,
+        totalCharacters: providerView.resume.length,
+      },
+      jobDescription: providerView.jobDescription,
+      targetRole: providerView.targetRole,
+      targetLevel: providerView.targetLevel,
+      currentQuestion: "Why did you choose idempotent retries?",
+      publicTranscript: [
+        {
+          question: "What did you own?",
+          answer: { actor: "candidate", text: "I owned the migration." },
+        },
+      ],
+      providerView: "FULL_PROVIDER_VIEW_CANARY",
+      profileSnapshot: "RAW_PROFILE_CANARY",
+      interviewPlan: "HIDDEN_PLAN_CANARY",
+      judgeData: "JUDGE_CANARY",
+      repoTools: "REPO_CAPABILITY_CANARY",
+    } as Parameters<typeof agents.generateCandidateAnswer>[0] & Record<string, unknown>);
+
+    expect(result).toMatchObject({
+      status: "success",
+      generation: { contractVersion: "candidate-answer-v1" },
+    });
+    expect(captured).toMatchObject({
+      role: "candidate",
+      operation: "generate_candidate_answer",
+    });
+    expect(captured?.onOutputDelta).toBeUndefined();
+    const payload = JSON.parse(captured!.input) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual([
+      "currentQuestion",
+      "evidenceContext",
+      "hiringBar",
+      "interviewLanguage",
+      "publicTranscript",
+    ]);
+    for (const canary of [
+      "OPERATION_TOKEN_CANARY",
+      "FULL_PROVIDER_VIEW_CANARY",
+      "RAW_PROFILE_CANARY",
+      "HIDDEN_PLAN_CANARY",
+      "JUDGE_CANARY",
+      "REPO_CAPABILITY_CANARY",
+    ]) {
+      expect(captured!.input).not.toContain(canary);
+    }
+  });
+
+  it("rejects Candidate output beyond the 4000 Unicode-character contract", async () => {
+    const agents = createInterviewAgents(
+      new ScriptedRoleRunner([
+        {
+          status: "success",
+          value: { outcome: { text: "🙂".repeat(4_001) } },
+        },
+      ]),
+    );
+
+    await expect(
+      agents.generateCandidateAnswer({
+        operationToken: "operation-3",
+        interviewLanguage: "en-US",
+        questionContext: {
+          lines: [
+            {
+              source: "resume",
+              lineNumber: 1,
+              text: providerView.resume,
+              evidenceAnchorIds: ["anchor-1"],
+            },
+          ],
+          totalLines: 1,
+          totalCharacters: providerView.resume.length,
+        },
+        jobDescription: providerView.jobDescription,
+        targetRole: providerView.targetRole,
+        targetLevel: providerView.targetLevel,
+        currentQuestion: "What did you decide?",
+        publicTranscript: [],
+      }),
+    ).resolves.toMatchObject({ status: "failure", code: "schema_invalid" });
   });
 });

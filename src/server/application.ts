@@ -60,6 +60,51 @@ function createApplicationInterviewAgents(config: ServerConfig) {
           },
         };
       },
+      {
+        status: "success",
+        value: {
+          outcome: {
+            text:
+              "我亲自负责迁移范围与回滚决策，并选择幂等重试来降低重复处理风险。现有资料没有记录更细的团队分工；如果需要在真实面试中展开，我会先明确我负责的服务边界与可验证指标。",
+          },
+        },
+      },
+      (request) => {
+        const payload = JSON.parse(request.input) as {
+          plan: { attackChains: [{ evidenceAnchors: Array<{ id: string }> }] };
+        };
+        return {
+          status: "success",
+          value: {
+            outcome: {
+              status: "ask",
+              question: {
+                text: "你为什么选择幂等重试，而不是依赖一次性投递或人工补偿？",
+                difficulty: "target",
+                evidenceAnchorIds: [payload.plan.attackChains[0].evidenceAnchors[0].id],
+              },
+            },
+          },
+        };
+      },
+      (request) => {
+        const payload = JSON.parse(request.input) as {
+          plan: { attackChains: [{ evidenceAnchors: Array<{ id: string }> }] };
+        };
+        return {
+          status: "success",
+          value: {
+            outcome: {
+              status: "ask",
+              question: {
+                text: "如果迁移指标开始恶化，你会依据哪些信号触发回滚？",
+                difficulty: "target",
+                evidenceAnchorIds: [payload.plan.attackChains[0].evidenceAnchors[0].id],
+              },
+            },
+          },
+        };
+      },
     ]);
     return createInterviewAgents(roleRunner);
   }

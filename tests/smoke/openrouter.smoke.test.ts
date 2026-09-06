@@ -17,13 +17,14 @@ import type { ProviderViewContent } from "@/server/preparation-profiles";
 
 const liveTestsEnabled = process.env.RIVAL_RUN_LIVE_TESTS === "1";
 
-describe.skipIf(!liveTestsEnabled)("OpenRouter Step 2 live smoke", () => {
+describe.skipIf(!liveTestsEnabled)("OpenRouter Step 3 live smoke", () => {
   const config = parseServerConfig({
     ...process.env,
     RIVAL_DATABASE_PATH: process.env.RIVAL_DATABASE_PATH ?? ".data/live-smoke.db",
     RIVAL_HOST: "127.0.0.1",
   });
   const interviewerStatus = getProviderConfigurationStatus(config).interviewer;
+  const candidateStatus = getProviderConfigurationStatus(config).candidate;
   const agents = createInterviewAgents(new OpenRouterRoleRunner(config));
   const policy = createCoreLoopPolicySnapshot();
 
@@ -31,6 +32,14 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 2 live smoke", () => {
     if (interviewerStatus.status !== "configured") {
       throw new Error(
         `interviewer provider configuration is ${interviewerStatus.status}; missing: ${interviewerStatus.missingFields.join(", ") || "none"}`,
+      );
+    }
+  }
+
+  function requireConfiguredCandidate(): void {
+    if (candidateStatus.status !== "configured") {
+      throw new Error(
+        `candidate provider configuration is ${candidateStatus.status}; missing: ${candidateStatus.missingFields.join(", ") || "none"}`,
       );
     }
   }
@@ -149,5 +158,44 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 2 live smoke", () => {
       }),
     );
     expect(chain.status).toBe("needs_input");
+  }, 120_000);
+
+  it("generates one bounded Candidate answer from synthetic evidence", async () => {
+    requireConfiguredCandidate();
+    const evidence = "Synthetic candidate chose idempotent retries and reduced duplicate processing by 35%.";
+    const result = await agents.generateCandidateAnswer({
+      operationToken: "synthetic-candidate-answer",
+      interviewLanguage: "en-US",
+      questionContext: {
+        lines: [
+          {
+            source: "resume",
+            lineNumber: 1,
+            text: evidence,
+            evidenceAnchorIds: ["synthetic-anchor-1"],
+          },
+        ],
+        totalLines: 1,
+        totalCharacters: evidence.length,
+      },
+      jobDescription: "Own reliable distributed backend systems.",
+      targetRole: "Backend Engineer",
+      targetLevel: "Senior",
+      currentQuestion: "Why did you choose idempotent retries?",
+      publicTranscript: [],
+    });
+    expect(result.status, "Candidate provider call failed").toBe("success");
+    if (result.status !== "success") throw new Error(result.message);
+    console.log(
+      JSON.stringify({
+        scenario: "en-US-candidate-answer",
+        provider: candidateStatus.provider,
+        model: candidateStatus.model,
+        requests: result.generation.usage.requests,
+        answerCharacters: Array.from(result.value.text).length,
+      }),
+    );
+    expect(Array.from(result.value.text).length).toBeGreaterThan(0);
+    expect(Array.from(result.value.text).length).toBeLessThanOrEqual(4_000);
   }, 120_000);
 });

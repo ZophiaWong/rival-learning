@@ -1,10 +1,16 @@
 import Database from "better-sqlite3";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { migrateDatabase } from "@/server/persistence/migrate";
+import {
+  DATABASE_EPOCH,
+  DatabaseResetConfirmationError,
+  DatabaseResetRequiredError,
+  migrateDatabase,
+  resetDatabase,
+} from "@/server/persistence/migrate";
 
 describe("database migration interface", () => {
   const temporaryDirectories: string[] = [];
@@ -41,7 +47,7 @@ describe("database migration interface", () => {
     ]);
   });
 
-  it("removes legacy Sessions and their dependent facts while preserving Profiles and ProviderViews", () => {
+  it("fails closed on populated legacy data and resets only with explicit confirmation", () => {
     const directory = mkdtempSync(join(tmpdir(), "rival-learning-step2-migration-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "app.db");
@@ -124,21 +130,46 @@ describe("database migration interface", () => {
         '{"status":"applied"}',
         timestamp,
       );
-    const latestMigration = database
-      .prepare("select id from __drizzle_migrations order by created_at desc limit 1")
-      .get() as { id: number };
-    database.prepare("delete from __drizzle_migrations where id = ?").run(latestMigration.id);
+    database.pragma("user_version = 2");
     database.close();
 
-    migrateDatabase(databasePath);
+    expect(() => migrateDatabase(databasePath)).toThrow(DatabaseResetRequiredError);
+    expect(() => migrateDatabase(databasePath)).toThrow(
+      /pnpm db:reset -- --confirm-reset/,
+    );
 
     const verified = new Database(databasePath, { readonly: true });
-    expect(verified.prepare("select count(*) as count from sessions").get()).toEqual({ count: 0 });
-    expect(verified.prepare("select count(*) as count from session_timeline").get()).toEqual({ count: 0 });
-    expect(verified.prepare("select count(*) as count from idempotency_results").get()).toEqual({ count: 0 });
+    expect(verified.prepare("select count(*) as count from sessions").get()).toEqual({ count: 1 });
+    expect(verified.prepare("select count(*) as count from session_timeline").get()).toEqual({ count: 1 });
+    expect(verified.prepare("select count(*) as count from idempotency_results").get()).toEqual({ count: 1 });
     expect(verified.prepare("select count(*) as count from preparation_profiles").get()).toEqual({ count: 1 });
     expect(verified.prepare("select count(*) as count from provider_views").get()).toEqual({ count: 1 });
     verified.close();
+
+    expect(() => resetDatabase(databasePath, undefined)).toThrow(
+      DatabaseResetConfirmationError,
+    );
+    const stillPresent = new Database(databasePath, { readonly: true });
+    expect(stillPresent.prepare("select count(*) as count from sessions").get()).toEqual({ count: 1 });
+    stillPresent.close();
+
+    const adjacentFixture = join(directory, "private-fixture.md");
+    writeFileSync(adjacentFixture, "must survive");
+    writeFileSync(`${databasePath}-wal`, "stale wal");
+    writeFileSync(`${databasePath}-shm`, "stale shm");
+    writeFileSync(`${databasePath}-journal`, "stale journal");
+
+    expect(resetDatabase(databasePath, "--confirm-reset")).toBe(databasePath);
+
+    const reset = new Database(databasePath, { readonly: true });
+    expect(reset.pragma("user_version", { simple: true })).toBe(DATABASE_EPOCH);
+    expect(reset.prepare("select count(*) as count from sessions").get()).toEqual({ count: 0 });
+    expect(reset.prepare("select count(*) as count from preparation_profiles").get()).toEqual({ count: 0 });
+    reset.close();
+    expect(existsSync(`${databasePath}-wal`)).toBe(false);
+    expect(existsSync(`${databasePath}-shm`)).toBe(false);
+    expect(existsSync(`${databasePath}-journal`)).toBe(false);
+    expect(readFileSync(adjacentFixture, "utf8")).toBe("must survive");
   });
 
   it("keeps committed timeline events immutable", () => {

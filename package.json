@@ -18,7 +18,8 @@
     "test:smoke:openrouter": "node --env-file-if-exists=.env.local node_modules/vitest/vitest.mjs run --disableConsoleIntercept tests/smoke/openrouter.smoke.test.ts",
     "test:e2e": "playwright test",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "node --env-file-if-exists=.env.local --import tsx scripts/migrate.ts"
+    "db:migrate": "node --env-file-if-exists=.env.local --import tsx scripts/migrate.ts",
+    "db:reset": "node --env-file-if-exists=.env.local --import tsx scripts/reset-database.ts"
   },
   "dependencies": {
     "@openai/agents": "0.17.0",
