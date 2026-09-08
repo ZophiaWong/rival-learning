@@ -232,6 +232,18 @@ function createApplicationInterviewAgents(config: ServerConfig) {
           },
         };
       },
+      { status: "success", value: { outcome: {
+        targetDimension: "evidence_and_outcome", microExplanation: "将技术选择与可观测结果连接，先定义基线和比较窗口。",
+        question: "假设你正在灰度上线支付服务，如何验证这次发布是否改善了可靠性？",
+        scenarioChange: "从队列迁移转为支付服务灰度发布。",
+      } } },
+      { status: "success", value: { outcome: {
+        covered: false, explanation: "目前没有明确比较指标与基线。", answerExcerpts: [],
+      } } },
+      { status: "success", value: { outcome: { hint: "考虑发布前后的同类流量，选择一个可以比较的可靠性指标。" } } },
+      { status: "success", value: { outcome: {
+        covered: true, explanation: "回答主动比较同类流量中的失败率。", answerExcerpts: ["比较发布前后的支付失败率"],
+      } } },
       {
         status: "success",
         value: {

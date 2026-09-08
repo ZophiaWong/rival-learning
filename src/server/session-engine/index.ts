@@ -1,3 +1,6 @@
+import { requestAccounting } from "@/server/interview-agents/role-runner/accounting";
+import { normalizeQuestionV1 } from "@/server/core-loop/question-normalizer";
+import { calibrationSchema, rechallengePreparationSchema, rechallengeEvaluationSchema, rechallengeHintSchema } from "@/server/core-loop/learning";
 import Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 
@@ -7,7 +10,6 @@ import {
   createAttackChainExecutionState,
   settleQuestionTurn,
   takeOverQuestionTurn,
-  type AttackChainPendingEvent,
   type QuestionSemanticRejectionReason,
 } from "@/server/core-loop/attack-chain-execution";
 import {
@@ -78,12 +80,24 @@ export interface SessionView {
   profileSnapshot: ProfileSnapshot;
   status: SessionStatus;
   state: PublicSessionState;
+  usage: GenerationUsage & { limit: number };
   version: number;
   createdAt: string;
   updatedAt: string;
 }
 
 export type SessionCommand =
+  | { type: "calibrate_finding"; sessionId: string; idempotencyKey: string; findingId: string; calibration: "accurate" | "partial" | "inaccurate" }
+  | { type: "submit_rechallenge_answer"; sessionId: string; idempotencyKey: string; answer: string }
+  | { type: "add_reflection"; sessionId: string; idempotencyKey: string; turnId: string; text: string }
+  | { type: "prepare_rechallenge"; sessionId: string; idempotencyKey: string }
+  | { type: "evaluate_rechallenge"; sessionId: string; idempotencyKey: string }
+  | { type: "generate_hint"; sessionId: string; idempotencyKey: string }
+  | { type: "skip_rechallenge"; sessionId: string; idempotencyKey: string }
+  | { type: "finish_rechallenge"; sessionId: string; idempotencyKey: string }
+  | { type: "extend_budget"; sessionId: string; idempotencyKey: string }
+  | { type: "resume_error"; sessionId: string; idempotencyKey: string }
+
   | {
       type: "create_session";
       sessionId: string;
@@ -168,6 +182,7 @@ interface InternalSession {
   row: SessionRow;
   profileSnapshot: ProfileSnapshot;
   state: SessionStateV4;
+  usage: SessionView["usage"];
 }
 
 interface ReservedOperation {
@@ -194,7 +209,13 @@ function commandFingerprint(command: SessionCommand): string {
         interviewLanguage: command.interviewLanguage,
       };
     }
-    if (command.type === "submit_human_answer") {
+    if (command.type === "calibrate_finding") {
+      return { type: command.type, sessionId: command.sessionId, findingId: command.findingId, calibration: command.calibration };
+    }
+    if (command.type === "add_reflection") {
+      return { type: command.type, sessionId: command.sessionId, turnId: command.turnId, text: command.text.trim() };
+    }
+    if (command.type === "submit_human_answer" || command.type === "submit_rechallenge_answer") {
       return { type: command.type, sessionId: command.sessionId, answer: command.answer.trim() };
     }
     return { type: command.type, sessionId: command.sessionId };
@@ -282,6 +303,7 @@ function contractVersionForOperation(
   operation: SessionOperation,
   checkpointStage: CheckpointStage | null = null,
 ): GenerationMetadata["contractVersion"] {
+  if (["prepare_rechallenge", "evaluate_rechallenge", "generate_hint"].includes(operation)) return "rechallenge-v1";
   if (operation === "generate_plan") return policy.plannerContractVersion;
   if (operation === "request_ai_answer") return policy.candidateAnswerContractVersion;
   if (operation === "generate_checkpoint") {
@@ -297,7 +319,10 @@ function localizedFailureMessage(
   operation: SessionOperation,
   code: string,
 ): string {
+  if (code === "invalid_learning_result") return language === "zh-CN" ? "模型返回的训练内容未通过校验，请恢复并重试。" : "The learning response failed validation. Resume to try again.";
+  if (code === "budget_exhausted") return language === "zh-CN" ? "请求预算已用完，请增加 20 次后继续。" : "Request budget exhausted. Add 20 requests to continue.";
   const operationLabel = (() => {
+    if (["prepare_rechallenge", "evaluate_rechallenge", "generate_hint"].includes(operation)) return "Rechallenge";
     if (operation === "generate_plan") return language === "zh-CN" ? "面试计划" : "interview plan";
     if (operation === "start") return language === "zh-CN" ? "首个问题" : "first question";
     if (operation === "request_ai_answer") {
@@ -335,6 +360,7 @@ function localizedFailureMessage(
 function mapSession(session: InternalSession): SessionView {
   return {
     id: session.row.id,
+    usage: session.usage,
     sourceProfileId: session.row.source_profile_id,
     profileSnapshot: session.profileSnapshot,
     status: session.state.phase,
@@ -366,6 +392,27 @@ class ApplicationSessionEngine implements SessionEngine {
   }
 
   async dispatch(command: SessionCommand): Promise<DispatchResult> {
+    return requestAccounting.run({
+      reserve: () => this.reserveRequest(command.sessionId, command.idempotencyKey),
+      settle: (id, input, output) => { this.database.prepare(
+        "update model_requests set input_tokens = ?, output_tokens = ?, usage_complete = ? where id = ?"
+      ).run(input, output, input !== null && output !== null ? 1 : 0, id); },
+    }, () => this.dispatchCommand(command));
+  }
+
+  private async dispatchCommand(command: SessionCommand): Promise<DispatchResult> {
+    const replay = this.findIdempotencyResult(command);
+    if (replay) return replay;
+    if (command.type !== "create_session") {
+      const current = this.findSessionOrReject(command);
+      if ("status" in current) return current;
+      if (current.state.phase === "budget_paused" && command.type !== "extend_budget")
+        return this.commitRejection(command, { status: "rejected", error: { code: "budget_paused", message: "请增加 20 次请求预算后继续。" } });
+    }
+    if (["prepare_rechallenge", "evaluate_rechallenge", "generate_hint"].includes(command.type))
+      return this.runLearningOperation(command as Extract<SessionCommand, { type: "prepare_rechallenge" | "evaluate_rechallenge" | "generate_hint" }>);
+    if (["calibrate_finding", "submit_rechallenge_answer", "add_reflection", "skip_rechallenge", "finish_rechallenge", "extend_budget", "resume_error"].includes(command.type))
+      return this.learningAction(command);
     if (command.type === "create_session") return this.createSession(command);
     if (command.type === "generate_plan") return this.generatePlan(command);
     if (command.type === "start") return this.startSession(command);
@@ -373,7 +420,7 @@ class ApplicationSessionEngine implements SessionEngine {
     if (command.type === "request_next_question") return this.requestNextQuestion(command);
     if (command.type === "generate_checkpoint") return this.generateCheckpoint(command);
     if (command.type === "take_over") return this.takeOver(command);
-    return this.submitHumanAnswer(command);
+    return this.submitHumanAnswer(command as Extract<SessionCommand, { type: "submit_human_answer" }>);
   }
 
   get(sessionId: string): SessionView {
@@ -418,6 +465,180 @@ class ApplicationSessionEngine implements SessionEngine {
     this.database.close();
   }
 
+  private requestUsage(sessionId: string, limit: number): SessionView["usage"] {
+    const row = this.database.prepare(`select count(*) as requests,
+      coalesce(sum(input_tokens), 0) as inputTokens, coalesce(sum(output_tokens), 0) as outputTokens,
+      count(case when usage_complete = 0 then 1 end) as incomplete
+      from model_requests where session_id = ?`).get(sessionId) as {
+        requests: number; inputTokens: number; outputTokens: number; incomplete: number;
+      };
+    return { requests: row.requests, inputTokens: row.inputTokens, outputTokens: row.outputTokens,
+      usageComplete: row.incomplete === 0, limit };
+  }
+
+  private reserveRequest(sessionId: string, idempotencyKey: string): string | null {
+    return this.database.transaction(() => {
+      const session = this.getInternal(sessionId);
+      if (!session.row.operation_token || session.state.activeOperation?.idempotencyKey !== idempotencyKey || session.usage.requests >= session.usage.limit) return null;
+      const id = randomUUID();
+      this.database.prepare("insert into model_requests (id, session_id, operation_token) values (?, ?, ?)")
+        .run(id, sessionId, session.row.operation_token);
+      return id;
+    }).immediate();
+  }
+
+  private learningAction(command: SessionCommand): DispatchResult {
+    const replay = this.findIdempotencyResult(command);
+    if (replay) return replay;
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token) return this.sessionBusy(command.type);
+    const state = sessionStateV4Schema.parse(session.state);
+    const reject = (message: string) => this.commitRejection(command, {
+      status: "rejected", error: { code: "learning_action_not_available", message },
+    });
+    const commit = (type: TimelineEvent["type"], payload: TimelineEvent["payload"]) =>
+      this.commitSynchronousCommand(command, session, state, [{ type, payload }]);
+    if (command.type === "extend_budget") {
+      if (state.phase !== "budget_paused") return reject("预算尚未暂停。");
+      state.budgetLimit += 20;
+      // Keep the saved operation until the explicit resume action.
+      state.phase = "error";
+      return commit("budget_extended", { limit: state.budgetLimit, added: 20 });
+    }
+    if (command.type === "resume_error") {
+      if (state.phase !== "error" || !state.failedOperation) return reject("没有可恢复的操作。");
+      const operation = state.failedOperation.type;
+      state.phase = state.failedOperation.priorPhase;
+      state.failedOperation = null;
+      return commit("operation_resumed", { operation });
+    }
+    if (command.type === "add_reflection") {
+      const text = answerTextSchema.safeParse(command.text);
+      const turn = state.execution?.turns.find(turn => turn.id === command.turnId);
+      if (!text.success || turn?.answer?.actor !== "human") return reject("只能为已提交的个人回答追加复盘。");
+      return commit("reflection_added", { turnId: command.turnId, text: text.data });
+    }
+    if (state.phase !== "active" || state.checkpoint?.status !== "completed" || !state.checkpoint.result)
+      return reject("请先完成 Checkpoint。");
+    const checkpoint = state.checkpoint.result;
+    if (command.type === "calibrate_finding") {
+      const finding = checkpoint.findings.find(item => item.id === command.findingId);
+      const parsed = calibrationSchema.safeParse(command.calibration);
+      if (!finding || !parsed.success) return reject("无效的差距校准。");
+      if (finding.calibration !== "unreviewed") {
+        if (finding.calibration !== parsed.data) return reject("该差距已完成校准。");
+        return this.commitSynchronousCommand(command, session, state, []);
+      }
+      finding.calibration = parsed.data;
+      if (parsed.data !== "inaccurate") state.learning.gaps.push({
+        id: this.createEntityId(), findingId: finding.id, targetDimension: finding.targetDimension,
+        priority: finding.priority, status: "open",
+      });
+      return commit("finding_calibrated", { findingId: finding.id, calibration: parsed.data });
+    }
+    const challenge = state.learning.rechallenge;
+    if (!challenge || challenge.outcome) return reject("没有待完成的 Rechallenge。");
+    const gap = state.learning.gaps.find(item => item.id === challenge.gapId)!;
+    if (command.type === "submit_rechallenge_answer") {
+      const answer = answerTextSchema.safeParse(command.answer);
+      const last = challenge.attempts.at(-1);
+      if (!answer.success || (last && (!last.evaluation || !challenge.hint)) || challenge.attempts.length >= 2)
+        return reject("请完成当前回答的评价；再次作答需要先使用一次 L1 提示。");
+      challenge.attempts.push({ answer: answer.data, hinted: challenge.hint !== null, evaluation: null });
+    } else if (command.type === "skip_rechallenge") {
+      if (challenge.attempts.some(attempt => !attempt.evaluation)) return reject("请先评价已提交的回答。");
+      gap.status = "deferred";
+      challenge.outcome = "deferred";
+    } else if (command.type === "finish_rechallenge") {
+      if (!challenge.attempts.at(-1)?.evaluation || challenge.attempts.at(-1)!.evaluation!.covered)
+        return reject("请先完成一次回答评价。");
+      gap.status = "unresolved";
+      challenge.outcome = "unresolved";
+    } else return reject("未知学习操作。");
+    return commit("learning_updated", { action: command.type, learning: state.learning });
+  }
+
+  private async runLearningOperation(command: Extract<SessionCommand, {
+    type: "prepare_rechallenge" | "evaluate_rechallenge" | "generate_hint"
+  }>): Promise<DispatchResult> {
+    const session = this.findSessionOrReject(command);
+    if ("status" in session) return session;
+    if (session.row.operation_token) return this.sessionBusy(command.type);
+    const state = session.state;
+    const checkpoint = state.checkpoint?.result;
+    const challenge = state.learning.rechallenge;
+    const gap = challenge ? state.learning.gaps.find(item => item.id === challenge.gapId)
+      : [...state.learning.gaps].sort((a, b) => a.priority - b.priority)[0];
+    const reject = (message: string) => this.commitRejection(command, {
+      status: "rejected", error: { code: "learning_action_not_available", message },
+    });
+    if (state.phase !== "active" || !checkpoint || !gap || !state.planRecord?.questionContext ||
+        checkpoint.findings.some(finding => finding.calibration === "unreviewed"))
+      return reject("请先完成全部差距校准，并至少接受一个差距。");
+    if (command.type === "prepare_rechallenge" && challenge) return reject("本次即时 Rechallenge 已生成。");
+    if (command.type !== "prepare_rechallenge" && (!challenge || challenge.outcome))
+      return reject("没有待处理的 Rechallenge。");
+    const attempt = challenge?.attempts.at(-1);
+    if (command.type === "evaluate_rechallenge" && (!attempt || attempt.evaluation))
+      return reject("没有待评价的回答。");
+    if (command.type === "generate_hint" && (challenge!.hint || !attempt?.evaluation || attempt.evaluation.covered))
+      return reject("第一次无提示回答未覆盖目标维度后，可以使用一次 L1 提示。");
+    const reserved = this.reserveOperation(command, session);
+    if (!reserved) return this.sessionBusy(command.type);
+    const finding = checkpoint.findings.find(item => item.id === gap.findingId)!;
+    const common = { interviewLanguage: state.interviewLanguage,
+      targetRole: session.profileSnapshot.providerView.targetRole,
+      targetLevel: session.profileSnapshot.providerView.targetLevel, targetDimension: gap.targetDimension };
+    let generation = emptyGeneration("rechallenge-v1");
+    try {
+      const result = command.type === "prepare_rechallenge"
+        ? await this.interviewAgents.prepareRechallenge({ ...common, findingSummary: finding.summary,
+            originalQuestions: state.execution!.turns.map(turn => turn.question.text),
+            evidenceContext: state.planRecord.questionContext })
+        : command.type === "generate_hint"
+          ? await this.interviewAgents.generateHint({ ...common, question: challenge!.preparation.question })
+          : await this.interviewAgents.evaluateRechallenge({ ...common, question: challenge!.preparation.question, answer: attempt!.answer });
+      generation = result.generation;
+      if (result.status === "failure") return this.commitOperationFailure({ command, reserved,
+        code: result.code, retryable: result.retryable, generation, rejectionCounts: {}, lastRejectionReason: null });
+      const next = sessionStateV4Schema.parse(reserved.state);
+      if (command.type === "prepare_rechallenge") {
+        const preparation = rechallengePreparationSchema.parse(result.value);
+        if (preparation.targetDimension !== gap.targetDimension ||
+          state.execution!.turns.some(turn => normalizeQuestionV1(turn.question.text) === normalizeQuestionV1(preparation.question)))
+          throw new Error("Invalid transfer question");
+        next.learning.rechallenge = { gapId: gap.id, preparation, hint: null, attempts: [], outcome: null };
+      } else if (command.type === "generate_hint") {
+        next.learning.rechallenge!.hint = rechallengeHintSchema.parse(result.value).hint;
+      } else {
+        const evaluation = rechallengeEvaluationSchema.parse(result.value);
+        if (evaluation.answerExcerpts.some(excerpt => !attempt!.answer.includes(excerpt)) ||
+            (evaluation.covered && evaluation.answerExcerpts.length === 0)) throw new Error("Invalid answer evidence");
+        const nextChallenge = next.learning.rechallenge!;
+        const nextAttempt = nextChallenge.attempts.at(-1)!;
+        nextAttempt.evaluation = evaluation;
+        const nextGap = next.learning.gaps.find(item => item.id === gap.id)!;
+        if (evaluation.covered) {
+          nextGap.status = nextAttempt.hinted ? "assisted_correction" : "improved";
+          nextChallenge.outcome = nextAttempt.hinted ? "AssistedCorrection" : "ProximalImprovement";
+        } else {
+          nextGap.status = "unresolved";
+          if (nextAttempt.hinted) nextChallenge.outcome = "unresolved";
+        }
+      }
+      next.activeOperation = null;
+      next.failedOperation = null;
+      const timestamp = this.now();
+      const event = parseTimelineEvent({ sequence: reserved.event.sequence + 1,
+        type: "learning_updated", payload: { action: command.type, learning: next.learning, generation }, createdAt: timestamp.toISOString() });
+      return this.commitSuccessfulOperation(command, reserved, next, [event], timestamp);
+    } catch {
+      return this.commitOperationFailure({ command, reserved, code: "invalid_learning_result",
+        retryable: true, generation, rejectionCounts: {}, lastRejectionReason: null });
+    }
+  }
+
   private getInternal(sessionId: string): InternalSession {
     const row = this.database
       .prepare(
@@ -435,6 +656,7 @@ class ApplicationSessionEngine implements SessionEngine {
       row,
       profileSnapshot: JSON.parse(row.profile_snapshot_json) as ProfileSnapshot,
       state: sessionStateV4Schema.parse(JSON.parse(row.state_json) as unknown),
+      usage: this.requestUsage(row.id, sessionStateV4Schema.parse(JSON.parse(row.state_json)).budgetLimit),
     };
   }
 
@@ -942,7 +1164,7 @@ class ApplicationSessionEngine implements SessionEngine {
         this.actionUnavailable("generate_checkpoint", "attack_chain_not_completed"),
       );
     }
-    if (session.state.checkpoint) {
+    if (session.state.checkpoint?.status === "completed") {
       return this.commitRejection(
         command,
         this.actionUnavailable("generate_checkpoint", "checkpoint_already_generated"),
@@ -963,7 +1185,7 @@ class ApplicationSessionEngine implements SessionEngine {
       );
     }
 
-    let reserved = this.reserveOperation(command, session, {
+    let reserved = this.reserveOperation(command, session, session.state.checkpoint ?? {
       status: "evaluating",
       chainId: chain.id,
       humanTurnIds: turns.map((turn) => turn.id),
@@ -974,9 +1196,9 @@ class ApplicationSessionEngine implements SessionEngine {
     });
     if (!reserved) return this.sessionBusy("generate Checkpoint");
     const appliedEvents: TimelineEvent[] = [reserved.event];
-    const evaluations: TurnEvaluation[] = [];
+    const evaluations: TurnEvaluation[] = [...(reserved.state.checkpoint?.evaluations ?? [])];
 
-    for (const turn of turns) {
+    for (const turn of turns.slice(evaluations.length)) {
       const answer = turn.answer;
       if (!answer || answer.actor !== "human") {
         return this.commitOperationFailure({
@@ -1089,10 +1311,10 @@ class ApplicationSessionEngine implements SessionEngine {
     const benchmarkRejectionCounts: Record<string, number> = {};
     const benchmarkSemanticRejections: string[] = [];
     let benchmarkLastReason: BenchmarkSemanticRejectionReason | null = null;
-    let benchmarkBatch: BenchmarkBatch | null = null;
+    let benchmarkBatch: BenchmarkBatch | null = reserved.state.checkpoint?.benchmarkBatch ?? null;
     for (
       let candidateNumber = 1;
-      candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
+      !benchmarkBatch && candidateNumber <= reserved.state.policy.maxSemanticCandidatesPerOperation;
       candidateNumber += 1
     ) {
       const candidate = await this.safeBenchmarks({
@@ -1155,6 +1377,7 @@ class ApplicationSessionEngine implements SessionEngine {
         },
       });
     }
+    if (!reserved.state.checkpoint?.benchmarkBatch) {
     const benchmarkEvent = parseTimelineEvent({
       sequence: reserved.event.sequence + 1,
       type: "benchmarks_generated",
@@ -1182,6 +1405,7 @@ class ApplicationSessionEngine implements SessionEngine {
     if (!benchmarkProgress) return this.operationConflict();
     reserved = benchmarkProgress;
     appliedEvents.push(benchmarkEvent);
+    }
 
     let checkpointGeneration = emptyGeneration(reserved.state.policy.checkpointContractVersion);
     const checkpointRejectionCounts: Record<string, number> = {};
@@ -1665,7 +1889,7 @@ class ApplicationSessionEngine implements SessionEngine {
     >,
     reserved: ReservedOperation,
     execution: NonNullable<SessionStateV4["execution"]>,
-    pendingEvents: AttackChainPendingEvent[],
+    pendingEvents: Array<{ type: TimelineEvent["type"]; payload: TimelineEvent["payload"] }>,
   ): DispatchResult {
     const timestamp = this.now();
     const nextState = sessionStateV4Schema.parse({
@@ -1685,7 +1909,7 @@ class ApplicationSessionEngine implements SessionEngine {
 
   private materializePendingEvents(
     firstSequence: number,
-    pendingEvents: AttackChainPendingEvent[],
+    pendingEvents: Array<{ type: TimelineEvent["type"]; payload: TimelineEvent["payload"] }>,
     timestamp: Date,
   ): TimelineEvent[] {
     return pendingEvents.map((event, index) =>
@@ -1768,10 +1992,10 @@ class ApplicationSessionEngine implements SessionEngine {
   }
 
   private commitSynchronousCommand(
-    command: Extract<SessionCommand, { type: "take_over" | "submit_human_answer" }>,
+    command: SessionCommand,
     session: InternalSession,
     nextState: SessionStateV4,
-    pendingEvents: AttackChainPendingEvent[],
+    pendingEvents: Array<{ type: TimelineEvent["type"]; payload: TimelineEvent["payload"] }>,
   ): DispatchResult {
     const timestamp = this.now();
     const events = this.materializePendingEvents(
@@ -1809,7 +2033,7 @@ class ApplicationSessionEngine implements SessionEngine {
   private commitSuccessfulOperation(
     command: Extract<
       SessionCommand,
-      { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" }
+      { type: "generate_plan" | "start" | "request_ai_answer" | "request_next_question" | "prepare_rechallenge" | "evaluate_rechallenge" | "generate_hint" }
     >,
     reserved: ReservedOperation,
     nextState: SessionStateV4,
@@ -1857,7 +2081,8 @@ class ApplicationSessionEngine implements SessionEngine {
           | "start"
           | "request_ai_answer"
           | "request_next_question"
-          | "generate_checkpoint";
+          | "generate_checkpoint"
+          | "prepare_rechallenge" | "evaluate_rechallenge" | "generate_hint";
       }
     >;
     reserved: ReservedOperation;
@@ -1889,7 +2114,7 @@ class ApplicationSessionEngine implements SessionEngine {
     );
     const nextState = sessionStateV4Schema.parse({
       ...reserved.state,
-      phase: "error",
+      phase: code === "budget_exhausted" ? "budget_paused" : "error",
       activeOperation: null,
       failedOperation: {
         type: activeOperation.type,
@@ -1932,11 +2157,12 @@ class ApplicationSessionEngine implements SessionEngine {
       const update = this.database
         .prepare(
           `update sessions
-           set status = 'error', state_json = ?, operation_token = null,
+           set status = ?, state_json = ?, operation_token = null,
                version = version + 1, updated_at = ?
            where id = ? and operation_token = ?`,
         )
         .run(
+          nextState.phase,
           JSON.stringify(nextState),
           timestamp.getTime(),
           command.sessionId,

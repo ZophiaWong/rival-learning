@@ -1,3 +1,4 @@
+import { rechallengePreparationSchema, rechallengeEvaluationSchema, rechallengeHintSchema } from "@/server/core-loop/learning";
 import { z } from "zod";
 
 import {
@@ -131,7 +132,28 @@ export type TurnEvaluationOutcome = AgentCandidateResult<TurnEvaluationCandidate
 export type BenchmarkBatchOutcome = AgentCandidateResult<BenchmarkBatchCandidate>;
 export type CheckpointReportOutcome = AgentCandidateResult<CheckpointReportCandidate>;
 
+export interface LearningInput {
+  interviewLanguage: InterviewLanguage;
+  targetRole: string;
+  targetLevel: string;
+  targetDimension: import("@/server/core-loop/domain").RubricDimension;
+  findingSummary: string;
+  originalQuestions: string[];
+  evidenceContext: QuestionContextPacket;
+}
+export interface EvaluateRechallengeInput {
+  interviewLanguage: InterviewLanguage;
+  targetRole: string;
+  targetLevel: string;
+  targetDimension: import("@/server/core-loop/domain").RubricDimension;
+  question: string;
+  answer: string;
+}
+
 export interface InterviewAgents {
+  prepareRechallenge(input: LearningInput): Promise<AgentCandidateResult<z.infer<typeof rechallengePreparationSchema>>>;
+  evaluateRechallenge(input: EvaluateRechallengeInput): Promise<AgentCandidateResult<z.infer<typeof rechallengeEvaluationSchema>>>;
+  generateHint(input: Omit<EvaluateRechallengeInput, "answer">): Promise<AgentCandidateResult<z.infer<typeof rechallengeHintSchema>>>;
   planSingleAttackChain(input: PlanSingleAttackChainInput): Promise<PlanOutcome>;
   generateNextQuestion(input: GenerateNextQuestionInput): Promise<NextQuestionOutcome>;
   generateCandidateAnswer(input: GenerateCandidateAnswerInput): Promise<CandidateAnswerOutcome>;
@@ -235,6 +257,44 @@ All user-visible text must be in ${outputLanguage}. Codes and IDs remain unchang
 
 class RoleRunnerInterviewAgents implements InterviewAgents {
   constructor(private readonly roleRunner: RoleRunner) {}
+
+  private async learningOperation<T>(role: "interviewer" | "judge", operation: string, instructions: string, input: unknown, schema: z.ZodType<T>): Promise<AgentCandidateResult<T>> {
+    const result = await this.roleRunner.runStructured({ role, operation, instructions,
+      input: JSON.stringify(input), outputSchema: z.strictObject({ outcome: schema }) });
+    const generation = generationMetadata("rechallenge-v1", result.usage, result.attempts);
+    if (result.status === "failure") return { status: "failure", code: result.error.code,
+      message: result.error.message, retryable: isRetryable(result.error.code), generation };
+    return { status: "success", value: result.value.outcome, generation };
+  }
+
+  prepareRechallenge(input: LearningInput) {
+    return this.learningOperation("interviewer", "prepare_rechallenge",
+      `Create a short micro-explanation for the accepted learning gap, then one hypothetical transfer question.
+Use a materially different scenario from ALL original questions, keeping exactly the supplied targetDimension. Explain the concrete scenario change.
+The explanation teaches the general principle without answering the new question. Do not invent past experience.
+Do not include a solution or hint for the new question. User-visible text: ${input.interviewLanguage}.`,
+      { interviewLanguage: input.interviewLanguage, targetRole: input.targetRole, targetLevel: input.targetLevel,
+        targetDimension: input.targetDimension, findingSummary: input.findingSummary,
+        originalQuestions: input.originalQuestions, evidenceContext: input.evidenceContext }, rechallengePreparationSchema);
+  }
+
+  evaluateRechallenge(input: EvaluateRechallengeInput) {
+    return this.learningOperation("judge", "evaluate_rechallenge",
+      `Evaluate only whether this answer actively covers the supplied targetDimension in the new scenario.
+Do not infer unstated understanding. covered=true requires at least one exact answer excerpt demonstrating coverage.
+All answerExcerpts must be exact substrings of the supplied answer. Explain briefly; no scores or mastery claims.
+User-visible text: ${input.interviewLanguage}.`,
+      { interviewLanguage: input.interviewLanguage, targetRole: input.targetRole, targetLevel: input.targetLevel,
+        targetDimension: input.targetDimension, question: input.question, answer: input.answer }, rechallengeEvaluationSchema);
+  }
+
+  generateHint(input: Omit<EvaluateRechallengeInput, "answer">) {
+    return this.learningOperation("interviewer", "generate_rechallenge_hint",
+      `Give exactly one L1 hint: a brief directional cue toward the targetDimension, without a full answer or worked solution.
+User-visible text: ${input.interviewLanguage}.`,
+      { interviewLanguage: input.interviewLanguage, targetRole: input.targetRole, targetLevel: input.targetLevel,
+        targetDimension: input.targetDimension, question: input.question }, rechallengeHintSchema);
+  }
 
   async planSingleAttackChain(input: PlanSingleAttackChainInput): Promise<PlanOutcome> {
     const result = await this.roleRunner.runStructured({

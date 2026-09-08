@@ -1,3 +1,4 @@
+import { requestAccounting, budgetExhaustedResult } from "./accounting";
 import {
   Agent,
   ModelBehaviorError,
@@ -420,6 +421,9 @@ export class OpenRouterRoleRunner implements RoleRunner {
     let schemaCorrection = "";
     let outputDelivered = false;
     for (let attemptNumber = 1; attemptNumber <= 3; attemptNumber += 1) {
+      const accounting = requestAccounting.getStore();
+      const receipt = accounting?.reserve();
+      if (receipt === null) return { ...budgetExhaustedResult(), attempts, usage: aggregateRoleRunUsage(attempts) };
       const startedAt = this.now();
       let invalidOutputResponse: ModelResponse | undefined;
       let streamedResponse: ModelResponse | undefined;
@@ -514,6 +518,7 @@ export class OpenRouterRoleRunner implements RoleRunner {
             ),
           };
           attempts.push(attempt);
+        if (receipt) accounting!.settle(receipt, attempt.inputTokens, attempt.outputTokens);
           return {
             status: "failure",
             error: {
@@ -542,6 +547,7 @@ export class OpenRouterRoleRunner implements RoleRunner {
           ),
         };
         attempts.push(attempt);
+        if (receipt) accounting!.settle(receipt, attempt.inputTokens, attempt.outputTokens);
         return {
           status: "success",
           value: finalOutput,
@@ -587,6 +593,7 @@ export class OpenRouterRoleRunner implements RoleRunner {
           ),
         };
         attempts.push(attempt);
+        if (receipt) accounting!.settle(receipt, attempt.inputTokens, attempt.outputTokens);
 
         if (classified.retryable && attemptNumber < 3) {
           if (classified.code === "schema_invalid") {

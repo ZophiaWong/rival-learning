@@ -45,6 +45,7 @@ export interface RoleRunUsage {
 }
 
 export type RoleRunErrorCode =
+  | "budget_exhausted"
   | "provider_not_configured"
   | "provider_unsupported"
   | "provider_auth_failed"

@@ -1908,4 +1908,130 @@ describe("SessionEngine.dispatch Interface", () => {
       engine.timeline("session-1").filter((event) => event.type === "operation_failed"),
     ).toHaveLength(1);
   });
+  async function learningFlow(extra: ScriptedRoleRunStep[] = []) {
+    const report = checkpointReportWithNoFindings();
+    if (typeof report !== "function") throw new Error("Expected fixture function");
+    await completeSingleHumanChain([
+      turnEvaluation("operational cost", "evidence_and_outcome"), benchmarkBatch(),
+      async request => {
+        const result = await report(request);
+        if (result.status !== "success") throw new Error("Expected fixture success");
+        const value = result.value as { outcome: { findings: unknown[] } };
+        const input = JSON.parse(request.input);
+        value.outcome.findings = [{ targetDimension: "evidence_and_outcome", summary: "Validate outcomes",
+          basis: "Metrics were missing", sourceTurnIds: [input.humanTurns[0].turnId] }];
+        return result;
+      },
+      ...extra,
+    ]);
+    expect(await engine.dispatch({ type: "generate_checkpoint", sessionId: "session-1", idempotencyKey: "checkpoint" })).toMatchObject({ status: "applied" });
+    return engine.get("session-1").state.checkpoint!.findings[0].id;
+  }
+
+  const preparationStep: ScriptedRoleRunStep = { status: "success", value: { outcome: {
+    targetDimension: "evidence_and_outcome", microExplanation: "Connect decisions to measurable results.",
+    question: "In a new payment service rollout, how would you validate its outcome?",
+    scenarioChange: "Transfer from queue migration to a hypothetical payment rollout.",
+  } } };
+  const evaluationStep = (covered: boolean): ScriptedRoleRunStep => ({ status: "success", value: { outcome: {
+    covered, explanation: covered ? "The answer names a measurable comparison." : "No measured comparison.",
+    answerExcerpts: covered ? ["Compare failure rate"] : [],
+  } } });
+
+  it.each(["ProximalImprovement", "AssistedCorrection", "unresolved", "deferred"] as const)(
+    "records %s without adding formal turns, preserves calibration and Reflection across restart", async outcome => {
+      const steps: ScriptedRoleRunStep[] = [preparationStep];
+      if (outcome !== "deferred") steps.push(evaluationStep(outcome === "ProximalImprovement"));
+      if (outcome === "AssistedCorrection" || outcome === "unresolved") steps.push(
+        { status: "success", value: { outcome: { hint: "Consider a before/after metric." } } },
+        evaluationStep(outcome === "AssistedCorrection"),
+      );
+      const findingId = await learningFlow(steps);
+      const calibration = { type: "calibrate_finding" as const, sessionId: "session-1", findingId,
+        calibration: "partial" as const, idempotencyKey: "calibrate" };
+      const calibrated = await engine.dispatch(calibration);
+      expect(await engine.dispatch(calibration)).toEqual(calibrated);
+      expect(await engine.dispatch({ ...calibration, idempotencyKey: "calibrate-again" })).toMatchObject({ status: "applied" });
+      expect(engine.get("session-1").state.learning.gaps).toHaveLength(1);
+      const beforeReflection = engine.get("session-1").state.checkpoint;
+      expect(await engine.dispatch({ type: "add_reflection", sessionId: "session-1", idempotencyKey: "reflect",
+        turnId: engine.get("session-1").state.execution!.turns[0].id, text: "I should quantify the outcome." })).toMatchObject({ status: "applied" });
+      expect(engine.get("session-1").state.checkpoint).toEqual(beforeReflection);
+      expect(await engine.dispatch({ type: "prepare_rechallenge", sessionId: "session-1", idempotencyKey: "prepare" })).toMatchObject({ status: "applied" });
+      if (outcome === "deferred") {
+        await engine.dispatch({ type: "skip_rechallenge", sessionId: "session-1", idempotencyKey: "skip" });
+      } else {
+        await engine.dispatch({ type: "submit_rechallenge_answer", sessionId: "session-1", idempotencyKey: "answer-r1", answer: "Compare failure rate before and after rollout." });
+        await engine.dispatch({ type: "evaluate_rechallenge", sessionId: "session-1", idempotencyKey: "evaluate-r1" });
+        if (outcome !== "ProximalImprovement") {
+          expect(await engine.dispatch({ type: "generate_hint", sessionId: "session-1", idempotencyKey: "hint" })).toMatchObject({ status: "applied" });
+          await engine.dispatch({ type: "submit_rechallenge_answer", sessionId: "session-1", idempotencyKey: "answer-r2", answer: "Compare failure rate before and after rollout." });
+          await engine.dispatch({ type: "evaluate_rechallenge", sessionId: "session-1", idempotencyKey: "evaluate-r2" });
+        }
+      }
+      expect(engine.get("session-1").state.learning.rechallenge?.outcome).toBe(outcome);
+      expect(engine.get("session-1").state.execution!.turns).toHaveLength(1);
+      const saved = engine.get("session-1");
+      reopen([]);
+      expect(engine.get("session-1")).toEqual(saved);
+      expect(engine.timeline("session-1").filter(e => e.type === "reflection_added")).toHaveLength(1);
+    },
+  );
+
+  it("honors inaccurate as final calibration without creating a gap or calling a model", async () => {
+    const findingId = await learningFlow();
+    const before = engine.get("session-1").usage.requests;
+    await engine.dispatch({ type: "calibrate_finding", sessionId: "session-1", idempotencyKey: "reject-finding", findingId, calibration: "inaccurate" });
+    expect(await engine.dispatch({ type: "prepare_rechallenge", sessionId: "session-1", idempotencyKey: "prepare" })).toMatchObject({ status: "rejected" });
+    expect(await engine.dispatch({ type: "calibrate_finding", sessionId: "session-1", idempotencyKey: "change-calibration", findingId, calibration: "accurate" })).toMatchObject({ status: "rejected" });
+    expect(engine.get("session-1").state.learning.gaps).toEqual([]);
+    expect(engine.get("session-1").usage.requests).toBe(before);
+  });
+
+  it("resumes a failed Checkpoint from its frozen evaluations after restart", async () => {
+    await completeSingleHumanChain([turnEvaluation("operational cost", "evidence_and_outcome"), providerFailure("synthetic/candidate")]);
+    await engine.dispatch({ type: "generate_checkpoint", sessionId: "session-1", idempotencyKey: "checkpoint-failure" });
+    const usage = engine.get("session-1").usage;
+    reopen([benchmarkBatch(), checkpointReportWithNoFindings()]);
+    expect(engine.get("session-1").usage).toEqual(usage);
+    await engine.dispatch({ type: "resume_error", sessionId: "session-1", idempotencyKey: "resume" });
+    expect(await engine.dispatch({ type: "generate_checkpoint", sessionId: "session-1", idempotencyKey: "checkpoint-retry" })).toMatchObject({ status: "applied" });
+    expect(engine.timeline("session-1").filter(event => event.type === "turn_evaluation_recorded")).toHaveLength(1);
+    expect(engine.get("session-1").usage.requests).toBe(usage.requests + 2);
+  });
+
+  it("pauses before request 61 including retries, extends once, and keeps usage on restart", async () => {
+    await createSession();
+    const database = new Database(databasePath);
+    const insert = database.prepare("insert into model_requests (id, session_id, operation_token, input_tokens, output_tokens) values (?, 'session-1', 'prior', 1, 1)");
+    for (let i = 0; i < 59; i++) insert.run(`prior-${i}`);
+    database.close();
+    reopen([{ ...readyPlan(), attempts: [attempt(1), attempt(2), attempt(3)] }]);
+    expect(await engine.dispatch({ type: "generate_plan", sessionId: "session-1", idempotencyKey: "boundary" })).toMatchObject({ status: "rejected", error: { code: "budget_exhausted" } });
+    expect(engine.get("session-1")).toMatchObject({ status: "budget_paused", usage: { requests: 60, limit: 60 } });
+    expect(engine.timeline("session-1").at(-1)).toMatchObject({ type: "operation_failed", payload: { usage: { requests: 1 } } });
+    expect(await engine.dispatch({ type: "resume_error", sessionId: "session-1", idempotencyKey: "cannot-resume" })).toMatchObject({ status: "rejected", error: { code: "budget_paused" } });
+    const extend = { type: "extend_budget" as const, sessionId: "session-1", idempotencyKey: "extend" };
+    const extended = await engine.dispatch(extend);
+    expect(await engine.dispatch(extend)).toEqual(extended);
+    reopen([readyPlan()]);
+    expect(engine.get("session-1").usage).toMatchObject({ requests: 60, limit: 80 });
+    await engine.dispatch({ type: "resume_error", sessionId: "session-1", idempotencyKey: "resume" });
+    expect(await engine.dispatch({ type: "generate_plan", sessionId: "session-1", idempotencyKey: "retry" })).toMatchObject({ status: "applied", session: { usage: { requests: 61, limit: 80 } } });
+    expect(engine.timeline("session-1").filter(e => e.type === "budget_extended")).toHaveLength(1);
+  });
+
+  it("upgrades Step 4 request history without resetting the saved Session", async () => {
+    await learningFlow();
+    const before = engine.get("session-1");
+    engine.close();
+    const database = new Database(databasePath);
+    database.exec("drop table model_requests");
+    database.exec("delete from __drizzle_migrations where created_at = (select max(created_at) from __drizzle_migrations)");
+    database.close();
+    migrateDatabase(databasePath);
+    engine = createEngine([]);
+    expect(engine.get("session-1")).toEqual(before);
+  });
+
 });

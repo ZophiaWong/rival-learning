@@ -1,3 +1,4 @@
+import { requestAccounting } from "@/server/interview-agents/role-runner/accounting";
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
 
@@ -172,6 +173,22 @@ function configuredEnvironment(secret: string) {
 }
 
 describe("OpenRouterRoleRunner", () => {
+  it("blocks a retry before a 61st HTTP request and settles the 60th request", async () => {
+    const mock = await startMockServer([{ status: 503, body: { error: { message: "retry" } } }]);
+    const runner = new OpenRouterRoleRunner(configuredEnvironment("sk-synthetic"), {
+      createClient: options => new OpenAI({ ...options, baseURL: mock.baseURL }), sleep: async () => {},
+    });
+    let requests = 59;
+    const settle = vi.fn();
+    const result = await requestAccounting.run({ reserve: () => requests < 60 ? String(++requests) : null, settle },
+      () => runner.runStructured({ role: "interviewer", operation: "budget-test", instructions: "Synthetic",
+        input: "Synthetic", outputSchema: z.object({ answer: z.string() }) }));
+    expect(result).toMatchObject({ status: "failure", error: { code: "budget_exhausted" }, usage: { requests: 1 } });
+    expect(requests).toBe(60);
+    expect(mock.requests).toHaveLength(1);
+    expect(settle).toHaveBeenCalledTimes(1);
+  });
+
   it("binds Candidate calls to the independent Candidate model and credential", async () => {
     const mock = await startMockServer([{ body: completion({ answer: "candidate response" }) }]);
     const clientOptions = vi.fn();

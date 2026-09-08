@@ -88,3 +88,12 @@ export const idempotencyResults = sqliteTable(
   },
   (table) => [primaryKey({ columns: [table.sessionId, table.idempotencyKey] })],
 );
+
+export const modelRequests = sqliteTable("model_requests", {
+  id: text("id").primaryKey(),
+  sessionId: text("session_id").notNull().references(() => sessions.id, { onDelete: "cascade" }),
+  operationToken: text("operation_token").notNull(),
+  usageComplete: integer("usage_complete").notNull().default(0),
+  inputTokens: integer("input_tokens"),
+  outputTokens: integer("output_tokens"),
+});
