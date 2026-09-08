@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { createInterviewAgents } from "@/server/interview-agents";
-import type { InterviewPlan } from "@/server/core-loop/domain";
+import { RUBRIC_DIMENSIONS, type InterviewPlan } from "@/server/core-loop/domain";
 import type { RoleRunRequest } from "@/server/interview-agents/role-runner";
 import { ScriptedRoleRunner } from "@/server/interview-agents/role-runner/scripted";
 import { scriptedRoleRunnerEnabled } from "@/server/interview-agents/runtime";
@@ -323,5 +323,301 @@ describe("InterviewAgents Interface", () => {
         publicTranscript: [],
       }),
     ).resolves.toMatchObject({ status: "failure", code: "schema_invalid" });
+  });
+
+  it("evaluates one human answer with a fixed rubric and no Benchmark visibility", async () => {
+    let captured: RoleRunRequest<unknown> | undefined;
+    const agents = createInterviewAgents(
+      new ScriptedRoleRunner([
+        (request) => {
+          captured = request;
+          return {
+            status: "success",
+            value: {
+              outcome: {
+                dimensions: RUBRIC_DIMENSIONS.map((dimension) => ({
+                  dimension,
+                  verdict: dimension === "evidence_and_outcome" ? "partial" : "met",
+                  rationale: "The answer addresses the requested dimension.",
+                  answerExcerpts: ["idempotent retries"],
+                })),
+              },
+            },
+          };
+        },
+      ]),
+    );
+
+    const result = await agents.evaluateHumanAnswer({
+      operationToken: "OPERATION_TOKEN_CANARY",
+      interviewLanguage: "en-US",
+      rubricVersion: "answer-rubric-v1",
+      questionContext: {
+        lines: [
+          {
+            source: "resume",
+            lineNumber: 1,
+            text: providerView.resume,
+            evidenceAnchorIds: ["anchor-1"],
+          },
+        ],
+        totalLines: 1,
+        totalCharacters: providerView.resume.length,
+      },
+      jobDescription: providerView.jobDescription,
+      targetRole: providerView.targetRole,
+      targetLevel: providerView.targetLevel,
+      knowledgeTarget: "Verify ownership and decision depth",
+      currentTurn: {
+        id: "turn-2",
+        question: "Why did you choose idempotent retries?",
+        answer: "I chose idempotent retries to control duplicate processing risk.",
+      },
+      priorPublicTranscript: [],
+      semanticRejections: [],
+      benchmark: "BENCHMARK_CANARY",
+      providerView: "FULL_PROVIDER_VIEW_CANARY",
+      profileSnapshot: "RAW_PROFILE_CANARY",
+      interviewPlan: "HIDDEN_PLAN_CANARY",
+      candidateGeneration: "CANDIDATE_GENERATION_CANARY",
+      repoTools: "REPO_CAPABILITY_CANARY",
+    } as Parameters<typeof agents.evaluateHumanAnswer>[0] & Record<string, unknown>);
+
+    expect(result).toMatchObject({
+      status: "success",
+      generation: { contractVersion: "judge-turn-evaluation-v1" },
+    });
+    expect(captured).toMatchObject({ role: "judge", operation: "evaluate_human_answer" });
+    expect(captured?.onOutputDelta).toBeUndefined();
+    const payload = JSON.parse(captured!.input) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual([
+      "currentTurn",
+      "evidenceContext",
+      "hiringBar",
+      "interviewLanguage",
+      "knowledgeTarget",
+      "priorPublicTranscript",
+      "rubric",
+      "semanticRejections",
+    ]);
+    expect(payload).toHaveProperty("rubric.version", "answer-rubric-v1");
+    expect(payload).toHaveProperty("rubric.dimensions", RUBRIC_DIMENSIONS);
+    for (const canary of [
+      "OPERATION_TOKEN_CANARY",
+      "BENCHMARK_CANARY",
+      "FULL_PROVIDER_VIEW_CANARY",
+      "RAW_PROFILE_CANARY",
+      "HIDDEN_PLAN_CANARY",
+      "CANDIDATE_GENERATION_CANARY",
+      "REPO_CAPABILITY_CANARY",
+    ]) {
+      expect(captured!.input).not.toContain(canary);
+    }
+  });
+
+  it("generates a Candidate Benchmark batch without human answers or Judge data", async () => {
+    let captured: RoleRunRequest<unknown> | undefined;
+    const agents = createInterviewAgents(
+      new ScriptedRoleRunner([
+        (request) => {
+          captured = request;
+          return {
+            status: "success",
+            value: {
+              outcome: {
+                benchmarks: [
+                  {
+                    turnId: "turn-2",
+                    text: "I would validate duplicate-rate and latency signals.",
+                    evidenceAnchorIds: ["anchor-1"],
+                  },
+                ],
+              },
+            },
+          };
+        },
+      ]),
+    );
+
+    const result = await agents.generateBenchmarks({
+      operationToken: "OPERATION_TOKEN_CANARY",
+      interviewLanguage: "en-US",
+      questionContext: {
+        lines: [
+          {
+            source: "resume",
+            lineNumber: 1,
+            text: providerView.resume,
+            evidenceAnchorIds: ["anchor-1"],
+          },
+        ],
+        totalLines: 1,
+        totalCharacters: providerView.resume.length,
+      },
+      jobDescription: providerView.jobDescription,
+      targetRole: providerView.targetRole,
+      targetLevel: providerView.targetLevel,
+      knowledgeTarget: "Verify ownership and decision depth",
+      humanQuestions: [
+        {
+          turnId: "turn-2",
+          question: "Why did you choose idempotent retries?",
+          evidenceAnchorIds: ["anchor-1"],
+        },
+      ],
+      semanticRejections: [],
+      humanAnswer: "HUMAN_ANSWER_CANARY",
+      judgeEvaluation: "JUDGE_EVALUATION_CANARY",
+      publicTranscript: "TRANSCRIPT_CANARY",
+      providerView: "FULL_PROVIDER_VIEW_CANARY",
+      profileSnapshot: "RAW_PROFILE_CANARY",
+      interviewPlan: "HIDDEN_PLAN_CANARY",
+      repoTools: "REPO_CAPABILITY_CANARY",
+    } as Parameters<typeof agents.generateBenchmarks>[0] & Record<string, unknown>);
+
+    expect(result).toMatchObject({
+      status: "success",
+      generation: { contractVersion: "candidate-benchmark-v1" },
+    });
+    expect(captured).toMatchObject({ role: "candidate", operation: "generate_benchmark_batch" });
+    const payload = JSON.parse(captured!.input) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual([
+      "evidenceContext",
+      "hiringBar",
+      "humanQuestions",
+      "interviewLanguage",
+      "knowledgeTarget",
+      "semanticRejections",
+    ]);
+    for (const canary of [
+      "OPERATION_TOKEN_CANARY",
+      "HUMAN_ANSWER_CANARY",
+      "JUDGE_EVALUATION_CANARY",
+      "TRANSCRIPT_CANARY",
+      "FULL_PROVIDER_VIEW_CANARY",
+      "RAW_PROFILE_CANARY",
+      "HIDDEN_PLAN_CANARY",
+      "REPO_CAPABILITY_CANARY",
+    ]) {
+      expect(captured!.input).not.toContain(canary);
+    }
+  });
+
+  it("synthesizes differences from frozen evaluations and Benchmarks through Judge", async () => {
+    let captured: RoleRunRequest<unknown> | undefined;
+    const agents = createInterviewAgents(
+      new ScriptedRoleRunner([
+        (request) => {
+          captured = request;
+          return {
+            status: "success",
+            value: {
+              outcome: {
+                comparisons: [
+                  {
+                    turnId: "turn-2",
+                    differences: [
+                      {
+                        dimension: "evidence_and_outcome",
+                        explanation: "The answer omits validation signals.",
+                        answerExcerpt: "idempotent retries",
+                        benchmarkExcerpt: "duplicate-rate and latency signals",
+                      },
+                    ],
+                  },
+                ],
+                findings: [
+                  {
+                    targetDimension: "evidence_and_outcome",
+                    summary: "Connect decisions to observable outcomes.",
+                    basis: "The answer does not identify validation signals.",
+                    sourceTurnIds: ["turn-2"],
+                  },
+                ],
+              },
+            },
+          };
+        },
+      ]),
+    );
+    const dimensions = RUBRIC_DIMENSIONS.map((dimension) => ({
+      dimension,
+      verdict: dimension === "evidence_and_outcome" ? "partial" : "met",
+      rationale: "Frozen rubric result.",
+      answerExcerpts: ["idempotent retries"],
+    }));
+
+    const result = await agents.generateCheckpointReport({
+      operationToken: "OPERATION_TOKEN_CANARY",
+      interviewLanguage: "en-US",
+      questionContext: {
+        lines: [
+          {
+            source: "resume",
+            lineNumber: 1,
+            text: providerView.resume,
+            evidenceAnchorIds: ["anchor-1"],
+          },
+        ],
+        totalLines: 1,
+        totalCharacters: providerView.resume.length,
+      },
+      jobDescription: providerView.jobDescription,
+      targetRole: providerView.targetRole,
+      targetLevel: providerView.targetLevel,
+      knowledgeTarget: "Verify ownership and decision depth",
+      humanTurns: [
+        {
+          turnId: "turn-2",
+          question: "Why did you choose idempotent retries?",
+          answer: "I chose idempotent retries to control duplicate processing risk.",
+        },
+      ],
+      evaluations: [{ turnId: "turn-2", dimensions }],
+      benchmarks: [
+        {
+          turnId: "turn-2",
+          text: "I would validate duplicate-rate and latency signals.",
+          evidenceAnchorIds: ["anchor-1"],
+        },
+      ],
+      publicTranscript: [],
+      semanticRejections: [],
+      evaluationGeneration: "EVALUATION_GENERATION_CANARY",
+      benchmarkGeneration: "BENCHMARK_GENERATION_CANARY",
+      providerView: "FULL_PROVIDER_VIEW_CANARY",
+      profileSnapshot: "RAW_PROFILE_CANARY",
+      interviewPlan: "HIDDEN_PLAN_CANARY",
+      repoTools: "REPO_CAPABILITY_CANARY",
+    } as unknown as Parameters<typeof agents.generateCheckpointReport>[0] & Record<string, unknown>);
+
+    expect(result).toMatchObject({
+      status: "success",
+      generation: { contractVersion: "judge-checkpoint-v1" },
+    });
+    expect(captured).toMatchObject({ role: "judge", operation: "generate_checkpoint_report" });
+    const payload = JSON.parse(captured!.input) as Record<string, unknown>;
+    expect(Object.keys(payload).sort()).toEqual([
+      "benchmarks",
+      "evaluations",
+      "evidenceContext",
+      "hiringBar",
+      "humanTurns",
+      "interviewLanguage",
+      "knowledgeTarget",
+      "publicTranscript",
+      "semanticRejections",
+    ]);
+    for (const canary of [
+      "OPERATION_TOKEN_CANARY",
+      "EVALUATION_GENERATION_CANARY",
+      "BENCHMARK_GENERATION_CANARY",
+      "FULL_PROVIDER_VIEW_CANARY",
+      "RAW_PROFILE_CANARY",
+      "HIDDEN_PLAN_CANARY",
+      "REPO_CAPABILITY_CANARY",
+    ]) {
+      expect(captured!.input).not.toContain(canary);
+    }
   });
 });

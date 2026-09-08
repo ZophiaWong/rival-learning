@@ -24,6 +24,7 @@ export const sessionActionRequestSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("start") }),
   z.strictObject({ type: z.literal("request_ai_answer") }),
   z.strictObject({ type: z.literal("request_next_question") }),
+  z.strictObject({ type: z.literal("generate_checkpoint") }),
   z.strictObject({ type: z.literal("take_over") }),
   z.strictObject({
     type: z.literal("submit_human_answer"),

@@ -86,18 +86,19 @@ MVP 验证即时迁移，canonical outcome 是 `ProximalImprovement`。它不等
 
 `AttackChain` 结束后按固定顺序执行：
 
-1. 为该链中的每个用户回答批量生成有证据约束的 `Benchmark`。
-2. `Judge` 先按 rubric 独立评价，再借助 `Benchmark` 解释差异。
-3. 展示 difference-first 报告；完整 `Benchmark` 默认折叠。
-4. 每次最多提出三个 `GapFinding`。
-5. 用户逐项校准为 `accurate`、`partial` 或 `inaccurate`。
-6. 只把 `accurate` 或 `partial` 转为 `LearningGap`；`inaccurate` 是用户的最终裁定，不参与难度调整或 `Rechallenge`。
-7. 展示针对已接受差距的 micro-explanation。
-8. 对最高优先级 `LearningGap` 发起一次即时 `Rechallenge`。
+1. `Judge` 按固定五维 rubric 逐题独立评价用户回答，并在处理下一题前持久化；此时不可见 `Benchmark`。
+2. `Candidate` 在不接收用户回答或 Judge 结果的前提下，一次批量生成与用户题目逐一对应、有证据约束的 `Benchmark`。
+3. `Judge` 接收冻结的评价、`Benchmark` 与必要上下文，综合逐题差异和 `GapFinding`；不得覆写既有评价。
+4. 展示 difference-first 报告；完整 `Benchmark` 与五维 rubric 默认折叠。
+5. 每次最多提出三个 `GapFinding`。
+6. 用户逐项校准为 `accurate`、`partial` 或 `inaccurate`。
+7. 只把 `accurate` 或 `partial` 转为 `LearningGap`；`inaccurate` 是用户的最终裁定，不参与难度调整或 `Rechallenge`。
+8. 展示针对已接受差距的 micro-explanation。
+9. 对最高优先级 `LearningGap` 发起一次即时 `Rechallenge`。
 
 用户可以在提交回答后追加 `Reflection`，但它不修改原评估，也不倒推改变已生成的追问。
 
-纯 A2A 链的 checkpoint 只展示参考回答中的有效 moves、可能被攻击的位置和可选挑战，不凭空创建用户的 `LearningGap`。
+Core Loop Step 4 只为至少包含一个 human answer 的已完成链生成 `Checkpoint`。纯 A2A 链明确提示当前不提供观察型 `Checkpoint`，不调用 Judge/Candidate checkpoint operation，也不创建 `GapFinding`；观察型形态留待完整 MVP 后续步骤。
 
 ## MVP 范围
 

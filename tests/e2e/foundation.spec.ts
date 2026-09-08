@@ -106,16 +106,38 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
     .fill("如果重复率或尾延迟持续越过阈值，我会停止扩量并按预案回滚。");
   await page.getByRole("button", { name: "提交回答", exact: true }).click();
   await expect(page.getByText("本条 AttackChain 已完成，transcript 现为只读。")).toBeVisible();
-  await expect(page.getByText("Checkpoint 将在 Step 4 提供。")).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成 Checkpoint", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "生成 Checkpoint", exact: true }).click();
+  await expect(page.getByRole("status")).toContainText("Checkpoint 已生成");
+  const checkpoint = page.getByLabel("Checkpoint");
+  await expect(checkpoint.getByRole("heading", { name: "Question 2 Checkpoint" })).toBeVisible();
+  await expect(checkpoint.getByRole("heading", { name: "Question 3 Checkpoint" })).toBeVisible();
+  await expect(checkpoint).toContainText("差异：evidence_and_outcome");
+  await expect(checkpoint).toContainText("你的原回答摘录：人工补偿成本");
+  await expect(checkpoint).toContainText("Benchmark 摘录：量化重复率");
+  await expect(checkpoint).toContainText("Priority 1 · evidence_and_outcome · unreviewed");
+  await expect(checkpoint).toContainText("Step 5 才能校准");
+  await checkpoint.getByText("完整 Benchmark").first().click();
+  await expect(checkpoint).toContainText("量化重复率、恢复时长和人工补偿成本");
+  await checkpoint.getByText("五维 Rubric").first().click();
+  await expect(checkpoint).toContainText("answer_relevance：met");
   await expect(page.getByRole("button", { name: "Candidate 回答", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "继续追问", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Auto", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Hand Back", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "生成 Checkpoint", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "accurate", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "partial", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "inaccurate", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Rechallenge/ })).toHaveCount(0);
 
   const sessionTimeline = page.getByLabel("Session timeline");
   await expect(sessionTimeline.locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
   await expect(sessionTimeline.locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);
   await expect(sessionTimeline.locator("li").filter({ hasText: "control_taken_over" })).toHaveCount(1);
+  await expect(sessionTimeline.locator("li").filter({ hasText: "turn_evaluation_recorded" })).toHaveCount(2);
+  await expect(sessionTimeline.locator("li").filter({ hasText: "benchmarks_generated" })).toHaveCount(1);
+  await expect(sessionTimeline.locator("li").filter({ hasText: "checkpoint_generated" })).toHaveCount(1);
   expect(new URL(page.url()).searchParams.get("session")).toBe(
     sessionCreateRequest?.body.sessionId,
   );
@@ -152,10 +174,24 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
   await expect(page.getByText(/我亲自负责迁移范围与回滚决策/)).toBeVisible();
   await expect(page.getByText(/我会比较重复处理风险/)).toBeVisible();
   await expect(page.getByText(/如果重复率或尾延迟持续越过阈值/)).toBeVisible();
+  await expect(page.getByLabel("Checkpoint")).toContainText(
+    "Priority 1 · evidence_and_outcome · unreviewed",
+  );
   await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
   await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);
+  await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "turn_evaluation_recorded" })).toHaveCount(2);
+  await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "checkpoint_generated" })).toHaveCount(1);
+
+  await page.getByRole("button", { name: "选择 Backend preparation (copy)" }).click();
+  await page.getByRole("button", { name: "确认 ProviderView" }).click();
+  await page.getByRole("button", { name: "创建 Session" }).click();
+  await page.getByRole("button", { name: "生成 InterviewPlan" }).click();
+  await page.getByRole("button", { name: "启动 Session" }).click();
+  await page.getByRole("button", { name: "Candidate 回答", exact: true }).click();
+  await expect(page.getByText("本条链全部由 Candidate 回答；Step 4 不提供观察型 Checkpoint。")).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成 Checkpoint", exact: true })).toHaveCount(0);
 
   await page.goto("/?session=missing-session");
   await expect(page.getByRole("status")).toContainText("无法恢复 URL 中的 Session");
-  await expect(page.getByRole("button", { name: /Backend preparation.*active/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: /Backend preparation.*active/ }).first()).toBeVisible();
 });

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createInterviewAgents } from "@/server/interview-agents";
+import { RUBRIC_DIMENSIONS } from "@/server/core-loop/domain";
 import type { ModelAttempt } from "@/server/interview-agents/role-runner";
 import {
   ScriptedRoleRunner,
@@ -60,6 +61,83 @@ function candidateAnswer(text = "I chose idempotent retries and owned the rollba
     status: "success" as const,
     value: { outcome: { text } },
     attempts: [{ ...attempt(), model: "synthetic/candidate" }],
+  };
+}
+
+function turnEvaluation(
+  excerpt: string,
+  partialDimension: (typeof RUBRIC_DIMENSIONS)[number],
+): ScriptedRoleRunStep {
+  return {
+    status: "success",
+    value: {
+      outcome: {
+        dimensions: RUBRIC_DIMENSIONS.map((dimension) => ({
+          dimension,
+          verdict: dimension === partialDimension ? "partial" : "met",
+          rationale: "The answer is grounded but leaves one dimension incomplete.",
+          answerExcerpts: [excerpt],
+        })),
+      },
+    },
+    attempts: [{ ...attempt(), model: "synthetic/judge" }],
+  };
+}
+
+function benchmarkBatch(text = "I would validate measurable service outcomes."): ScriptedRoleRunStep {
+  return (request) => {
+    const input = JSON.parse(request.input) as {
+      humanQuestions: Array<{ turnId: string; evidenceAnchorIds: string[] }>;
+    };
+    return {
+      status: "success",
+      value: {
+        outcome: {
+          benchmarks: input.humanQuestions.map((question) => ({
+            turnId: question.turnId,
+            text,
+            evidenceAnchorIds: [question.evidenceAnchorIds[0]],
+          })),
+        },
+      },
+      attempts: [{ ...attempt(), model: "synthetic/candidate" }],
+    };
+  };
+}
+
+function checkpointReportWithNoFindings(): ScriptedRoleRunStep {
+  return (request) => {
+    const input = JSON.parse(request.input) as {
+      humanTurns: Array<{ turnId: string }>;
+    };
+    return {
+      status: "success",
+      value: {
+        outcome: {
+          comparisons: input.humanTurns.map((turn) => ({
+            turnId: turn.turnId,
+            differences: [
+              {
+                dimension: "evidence_and_outcome",
+                explanation: "The Benchmark makes its validation signal explicit.",
+                answerExcerpt: "operational cost",
+                benchmarkExcerpt: "measurable service outcomes",
+              },
+            ],
+          })),
+          findings: [],
+        },
+      },
+      attempts: [{ ...attempt(), model: "synthetic/judge" }],
+    };
+  };
+}
+
+function providerFailure(model: string): ScriptedRoleRunStep {
+  return {
+    status: "failure",
+    error: { code: "provider_timeout", message: "private provider detail" },
+    attempts: [{ ...attempt(), model, outcome: "timeout" }],
   };
 }
 
@@ -193,6 +271,23 @@ describe("SessionEngine.dispatch Interface", () => {
       idempotencyKey: "start-1",
     });
     expect(started).toMatchObject({ status: "applied" });
+  }
+
+  async function completeSingleHumanChain(
+    checkpointSteps: ScriptedRoleRunStep[] = [],
+  ): Promise<void> {
+    await startFlow(checkpointSteps, 1);
+    await engine.dispatch({
+      type: "take_over",
+      sessionId: "session-1",
+      idempotencyKey: "take-over-1",
+    });
+    await engine.dispatch({
+      type: "submit_human_answer",
+      sessionId: "session-1",
+      answer: "I owned the rollback decision and validated operational cost.",
+      idempotencyKey: "human-1",
+    });
   }
 
   beforeEach(() => {
@@ -811,7 +906,7 @@ describe("SessionEngine.dispatch Interface", () => {
         turns: Array<{ answer: { actor: string; generation?: { contractVersion: string } } }>;
       };
     };
-    expect(persistedState.stateVersion).toBe(3);
+    expect(persistedState.stateVersion).toBe(4);
     expect(persistedState.execution.turns[0].answer).toMatchObject({
       actor: "candidate",
       generation: { contractVersion: "candidate-answer-v1" },
@@ -824,6 +919,555 @@ describe("SessionEngine.dispatch Interface", () => {
     reopen([]);
     expect(engine.get("session-1")).toEqual(beforeRestart);
     expect(engine.timeline("session-1")).toEqual(timeline);
+  });
+
+  it("generates an immutable rubric-first Checkpoint for only the human turns", async () => {
+    let humanTurnIds: string[] = [];
+    await startFlow([
+      candidateAnswer(),
+      nextQuestion("Why was idempotent retry the right tradeoff?"),
+      nextQuestion("Which signals would trigger rollback?"),
+      turnEvaluation("operational cost", "evidence_and_outcome"),
+      turnEvaluation("duplicate growth", "target_level_depth"),
+      (request) => {
+        const requestInput = JSON.parse(request.input) as {
+          humanQuestions: Array<{ turnId: string; evidenceAnchorIds: string[] }>;
+        };
+        humanTurnIds = requestInput.humanQuestions.map((question) => question.turnId);
+        const persisted = new Database(databasePath, { readonly: true });
+        const row = persisted
+          .prepare("select state_json from sessions where id = ?")
+          .get("session-1") as { state_json: string };
+        persisted.close();
+        const state = JSON.parse(row.state_json) as {
+          checkpoint: { status: string; evaluations: unknown[] };
+        };
+        expect(state.checkpoint).toMatchObject({ status: "benchmarking" });
+        expect(state.checkpoint.evaluations).toHaveLength(2);
+        return {
+          status: "success" as const,
+          value: {
+            outcome: {
+              benchmarks: [
+                {
+                  turnId: humanTurnIds[0],
+                  text: "I would compare duplicate risk, recovery time, and measurable validation signals.",
+                  evidenceAnchorIds: requestInput.humanQuestions[0].evidenceAnchorIds,
+                },
+                {
+                  turnId: humanTurnIds[1],
+                  text: "I would roll back on sustained duplicate growth or latency regression thresholds.",
+                  evidenceAnchorIds: requestInput.humanQuestions[1].evidenceAnchorIds,
+                },
+              ],
+            },
+          },
+          attempts: [{ ...attempt(), model: "synthetic/candidate" }],
+        };
+      },
+      (request) => {
+        const requestInput = JSON.parse(request.input) as {
+          humanTurns: Array<{ turnId: string }>;
+        };
+        return {
+          status: "success" as const,
+          value: {
+            outcome: {
+            comparisons: [
+              {
+                turnId: requestInput.humanTurns[0].turnId,
+                differences: [
+                  {
+                    dimension: "evidence_and_outcome",
+                    explanation: "The answer does not name measurable validation signals.",
+                    answerExcerpt: "operational cost",
+                    benchmarkExcerpt: "measurable validation signals",
+                  },
+                ],
+              },
+              {
+                turnId: requestInput.humanTurns[1].turnId,
+                differences: [
+                  {
+                    dimension: "target_level_depth",
+                    explanation: "The answer does not define sustained thresholds.",
+                    answerExcerpt: "duplicate growth",
+                    benchmarkExcerpt: "latency regression thresholds",
+                  },
+                ],
+              },
+            ],
+            findings: [
+              {
+                targetDimension: "evidence_and_outcome",
+                summary: "Connect decisions to measurable validation.",
+                basis: "The tradeoff answer omits concrete validation signals.",
+                sourceTurnIds: [requestInput.humanTurns[0].turnId],
+              },
+              {
+                targetDimension: "target_level_depth",
+                summary: "Define operational thresholds.",
+                basis: "The rollback answer names direction but not sustained thresholds.",
+                sourceTurnIds: [requestInput.humanTurns[1].turnId],
+              },
+            ],
+            },
+          },
+          attempts: [{ ...attempt(), model: "synthetic/judge" }],
+        };
+      },
+    ]);
+
+    await engine.dispatch({
+      type: "request_ai_answer",
+      sessionId: "session-1",
+      idempotencyKey: "candidate-1",
+    });
+    await engine.dispatch({
+      type: "request_next_question",
+      sessionId: "session-1",
+      idempotencyKey: "question-2",
+    });
+    await engine.dispatch({
+      type: "take_over",
+      sessionId: "session-1",
+      idempotencyKey: "take-over-1",
+    });
+    await engine.dispatch({
+      type: "submit_human_answer",
+      sessionId: "session-1",
+      answer: "I would compare duplicate risk, recovery time, and operational cost.",
+      idempotencyKey: "human-2",
+    });
+    await engine.dispatch({
+      type: "request_next_question",
+      sessionId: "session-1",
+      idempotencyKey: "question-3",
+    });
+    await engine.dispatch({
+      type: "submit_human_answer",
+      sessionId: "session-1",
+      answer: "I would roll back on sustained duplicate growth or latency regression.",
+      idempotencyKey: "human-3",
+    });
+
+    const generated = await engine.dispatch({
+      type: "generate_checkpoint",
+      sessionId: "session-1",
+      idempotencyKey: "checkpoint-1",
+    });
+    expect(generated).toMatchObject({
+      status: "applied",
+      session: {
+        state: {
+          checkpoint: {
+            status: "completed",
+            evaluations: [{ turnId: expect.any(String) }, { turnId: expect.any(String) }],
+            benchmarkBatch: {
+              benchmarks: [{ turnId: expect.any(String) }, { turnId: expect.any(String) }],
+            },
+            findings: [
+              { priority: 1, calibration: "unreviewed" },
+              { priority: 2, calibration: "unreviewed" },
+            ],
+          },
+        },
+      },
+    });
+    if (generated.status !== "applied") throw new Error("Checkpoint was not generated");
+    expect(generated.session.state.checkpoint?.evaluations.map((item) => item.turnId)).toEqual(
+      humanTurnIds,
+    );
+    expect(JSON.stringify(generated.session.state)).not.toContain("judge-turn-evaluation-v1");
+    expect(JSON.stringify(generated.session.state)).not.toContain("candidate-benchmark-v1");
+    expect(JSON.stringify(generated.session.state)).not.toContain("judge-checkpoint-v1");
+    expect(engine.timeline("session-1").map((event) => event.type).slice(-5)).toEqual([
+      "operation_started",
+      "turn_evaluation_recorded",
+      "turn_evaluation_recorded",
+      "benchmarks_generated",
+      "checkpoint_generated",
+    ]);
+
+    const persistedCheckpoint = generated.session.state.checkpoint;
+    reopen([]);
+    expect(engine.get("session-1").state.checkpoint).toEqual(persistedCheckpoint);
+
+    const replay = await engine.dispatch({
+      type: "generate_checkpoint",
+      sessionId: "session-1",
+      idempotencyKey: "checkpoint-1",
+    });
+    expect(replay).toEqual(generated);
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-2",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "checkpoint_already_generated" },
+      },
+    });
+  });
+
+  it("returns stable Checkpoint availability reasons", async () => {
+    await createSession();
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-draft",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "session_not_active" },
+      },
+    });
+
+    reopen([readyPlan(), firstQuestion()]);
+    await engine.dispatch({
+      type: "generate_plan",
+      sessionId: "session-1",
+      idempotencyKey: "plan-1",
+    });
+    await engine.dispatch({
+      type: "start",
+      sessionId: "session-1",
+      idempotencyKey: "start-1",
+    });
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-active",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "attack_chain_not_completed" },
+      },
+    });
+  });
+
+  it("does not offer an observational Checkpoint for a pure A2A chain", async () => {
+    await startFlow([candidateAnswer()], 1);
+    await engine.dispatch({
+      type: "request_ai_answer",
+      sessionId: "session-1",
+      idempotencyKey: "candidate-1",
+    });
+
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-a2a",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "no_human_answers" },
+      },
+    });
+  });
+
+  it.each([
+    {
+      stage: "evaluating" as const,
+      steps: [providerFailure("synthetic/judge")],
+      progressEvents: [] as string[],
+    },
+    {
+      stage: "benchmarking" as const,
+      steps: [
+        turnEvaluation("operational cost", "evidence_and_outcome"),
+        providerFailure("synthetic/candidate"),
+      ],
+      progressEvents: ["turn_evaluation_recorded"],
+    },
+    {
+      stage: "synthesizing" as const,
+      steps: [
+        turnEvaluation("operational cost", "evidence_and_outcome"),
+        benchmarkBatch(),
+        providerFailure("synthetic/judge"),
+      ],
+      progressEvents: ["turn_evaluation_recorded", "benchmarks_generated"],
+    },
+  ])(
+    "preserves hidden partial artifacts when the $stage Checkpoint stage fails",
+    async ({ stage, steps, progressEvents }) => {
+      await completeSingleHumanChain(steps);
+      const failed = await engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-failure",
+      });
+      expect(failed).toMatchObject({
+        status: "rejected",
+        error: { code: "provider_timeout", details: { stage } },
+      });
+      expect(engine.get("session-1")).toMatchObject({
+        status: "error",
+        state: {
+          checkpoint: null,
+          failedOperation: { type: "generate_checkpoint", stage },
+        },
+      });
+
+      const database = new Database(databasePath, { readonly: true });
+      const row = database
+        .prepare("select state_json from sessions where id = ?")
+        .get("session-1") as { state_json: string };
+      database.close();
+      const internalState = JSON.parse(row.state_json) as {
+        checkpoint: { status: string; evaluations: unknown[]; benchmarkBatch: unknown };
+      };
+      expect(internalState.checkpoint.status).toBe(stage);
+      expect(internalState.checkpoint.evaluations).toHaveLength(
+        stage === "evaluating" ? 0 : 1,
+      );
+      expect(internalState.checkpoint.benchmarkBatch === null).toBe(
+        stage !== "synthesizing",
+      );
+      expect(
+        engine.timeline("session-1").map((event) => event.type).slice(-(progressEvents.length + 1)),
+      ).toEqual([...progressEvents, "operation_failed"]);
+      expect(engine.timeline("session-1").at(-1)).toMatchObject({
+        type: "operation_failed",
+        payload: { operation: "generate_checkpoint", stage },
+      });
+
+      await expect(
+        engine.dispatch({
+          type: "generate_checkpoint",
+          sessionId: "session-1",
+          idempotencyKey: "checkpoint-failure",
+        }),
+      ).resolves.toEqual(failed);
+      await expect(
+        engine.dispatch({
+          type: "generate_checkpoint",
+          sessionId: "session-1",
+          idempotencyKey: "checkpoint-bypass",
+        }),
+      ).resolves.toMatchObject({
+        status: "rejected",
+        error: {
+          code: "generate_checkpoint_not_available",
+          details: { reason: "session_in_error" },
+        },
+      });
+    },
+  );
+
+  it("stops after three semantically invalid Judge evaluations", async () => {
+    const invalidEvaluation = {
+      status: "success" as const,
+      value: {
+        outcome: {
+          dimensions: RUBRIC_DIMENSIONS.map((dimension) => ({
+            dimension,
+            verdict: dimension === "evidence_and_outcome" ? "partial" as const : "met" as const,
+            rationale: "The answer leaves one dimension incomplete.",
+            answerExcerpts: ["text absent from the human answer"],
+          })),
+        },
+      },
+      attempts: [{ ...attempt(), model: "synthetic/judge" }],
+    };
+    await completeSingleHumanChain([
+      invalidEvaluation,
+      invalidEvaluation,
+      invalidEvaluation,
+    ]);
+
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-semantic-exhaustion",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "semantic_candidates_exhausted",
+        details: {
+          stage: "evaluating",
+          rejectionCounts: { evaluation_excerpt_not_found: 3 },
+          lastRejectionReason: "evaluation_excerpt_not_found",
+        },
+      },
+    });
+    expect(engine.timeline("session-1").at(-1)).toMatchObject({
+      type: "operation_failed",
+      payload: {
+        stage: "evaluating",
+        usage: { requests: 3 },
+        rejectionCounts: { evaluation_excerpt_not_found: 3 },
+      },
+    });
+  });
+
+  it("does not consume a Checkpoint key during concurrent generation", async () => {
+    let enteredResolve: () => void = () => undefined;
+    const entered = new Promise<void>((resolve) => {
+      enteredResolve = resolve;
+    });
+    let releaseResolve: () => void = () => undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    await completeSingleHumanChain([
+      async () => {
+        enteredResolve();
+        await release;
+        return {
+          status: "success",
+          value: {
+            outcome: {
+              dimensions: RUBRIC_DIMENSIONS.map((dimension) => ({
+                dimension,
+                verdict: dimension === "evidence_and_outcome" ? "partial" : "met",
+                rationale: "The answer leaves one dimension incomplete.",
+                answerExcerpts: ["operational cost"],
+              })),
+            },
+          },
+          attempts: [{ ...attempt(), model: "synthetic/judge" }],
+        };
+      },
+      benchmarkBatch(),
+      checkpointReportWithNoFindings(),
+    ]);
+
+    const pending = engine.dispatch({
+      type: "generate_checkpoint",
+      sessionId: "session-1",
+      idempotencyKey: "checkpoint-winner",
+    });
+    await entered;
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-loser",
+      }),
+    ).resolves.toMatchObject({ status: "rejected", error: { code: "session_busy" } });
+    releaseResolve();
+    await expect(pending).resolves.toMatchObject({ status: "applied" });
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-loser",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "checkpoint_already_generated" },
+      },
+    });
+  });
+
+  it("recovers an interrupted Checkpoint with persisted evaluations still hidden", async () => {
+    let enteredResolve: () => void = () => undefined;
+    const entered = new Promise<void>((resolve) => {
+      enteredResolve = resolve;
+    });
+    let releaseResolve: () => void = () => undefined;
+    const release = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    await completeSingleHumanChain([
+      turnEvaluation("operational cost", "evidence_and_outcome"),
+      async (request) => {
+        enteredResolve();
+        await release;
+        const input = JSON.parse(request.input) as {
+          humanQuestions: Array<{ turnId: string; evidenceAnchorIds: string[] }>;
+        };
+        return {
+          status: "success",
+          value: {
+            outcome: {
+              benchmarks: input.humanQuestions.map((question) => ({
+                turnId: question.turnId,
+                text: "I would validate measurable service outcomes.",
+                evidenceAnchorIds: [question.evidenceAnchorIds[0]],
+              })),
+            },
+          },
+          attempts: [{ ...attempt(), model: "synthetic/candidate" }],
+        };
+      },
+    ]);
+    const interruptedEngine = engine;
+    const pending = interruptedEngine.dispatch({
+      type: "generate_checkpoint",
+      sessionId: "session-1",
+      idempotencyKey: "checkpoint-interrupted",
+    });
+    await entered;
+
+    engine = createEngine([]);
+    expect(engine.get("session-1")).toMatchObject({
+      status: "error",
+      state: {
+        checkpoint: null,
+        failedOperation: {
+          type: "generate_checkpoint",
+          code: "operation_interrupted",
+          stage: "benchmarking",
+        },
+      },
+    });
+    expect(engine.timeline("session-1").slice(-2)).toMatchObject([
+      { type: "turn_evaluation_recorded" },
+      { type: "operation_failed", payload: { stage: "benchmarking" } },
+    ]);
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-interrupted",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "operation_interrupted",
+        details: { stage: "benchmarking" },
+      },
+    });
+    await expect(
+      engine.dispatch({
+        type: "generate_checkpoint",
+        sessionId: "session-1",
+        idempotencyKey: "checkpoint-after-interrupt",
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: {
+        code: "generate_checkpoint_not_available",
+        details: { reason: "session_in_error" },
+      },
+    });
+
+    releaseResolve();
+    await expect(pending).resolves.toMatchObject({
+      status: "rejected",
+      error: { code: "operation_conflict" },
+    });
+    interruptedEngine.close();
   });
 
   it("completes in the same answer transaction at planned depth", async () => {

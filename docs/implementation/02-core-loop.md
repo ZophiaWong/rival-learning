@@ -89,16 +89,20 @@
 
 ### 4. 评价回答并生成 Checkpoint
 
-保存 rubric-first turn evaluation；链结束时对 human questions 一次批量生成 `Benchmark`，再产生 difference-first 报告和最多三个 `GapFinding`。
+链完成且至少有一个 human answer 时，通过单一 `generate_checkpoint` command 固定执行“Judge 逐题独立评价并持久化 → Candidate 批量 Benchmark → Judge 差异综合”，再一次性公开 difference-first 报告和最多三个 `GapFinding`。
 
 **完成标准**：
 
 - Judge evaluation 在接收 `Benchmark` 前生成并持久化 rubric result；后续解释不能覆写它。
 - `Judge` 实际输入组装与角色隔离由本步骤验收，不以前一步尚未存在的 operation 做静态占位验收。
+- 每个 human turn 精确使用 `answer_relevance`、`ownership_scope`、`decision_reasoning`、`evidence_and_outcome`、`target_level_depth` 五维 rubric，verdict 为 `met | partial | missing | not_applicable`，不计算总分。
 - 链末一个 batch operation 为每个 human answer 返回证据约束的 `Benchmark`，数量与顺序精确对应。
+- Candidate Benchmark 不接收 human answer、Judge data 或完整 transcript；Judge 的首轮评价不接收 Benchmark；综合 Judge 只接收明确白名单字段。
+- `SessionEngine` 验证所有 answer/Benchmark 摘录为对应文本精确子串，并验证 finding 只能由同维度的 `partial`/`missing` 结果支撑。
 - 默认视图先展示差异与证据，完整 `Benchmark` 可折叠展开。
 - 每个 finding 初始 calibration 为 `unreviewed`，数量为 0–3，并带目标维度、依据和优先级。
 - 纯 A2A 或没有 human answer 时不创建用户 finding；本 milestone 可以明确提示该 checkpoint 形态尚未实现。
+- 中途失败保留已提交的内部 evaluation/Benchmark，但公开 state、HTTP/SSE 和 DOM 不泄露半成品；恢复 command 留到 Step 7。
 
 ### 5. 校准并完成 Rechallenge
 

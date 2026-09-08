@@ -48,7 +48,7 @@ describe("database migration interface", () => {
   });
 
   it("fails closed on populated legacy data and resets only with explicit confirmation", () => {
-    const directory = mkdtempSync(join(tmpdir(), "rival-learning-step2-migration-"));
+    const directory = mkdtempSync(join(tmpdir(), "rival-learning-step4-migration-"));
     temporaryDirectories.push(directory);
     const databasePath = join(directory, "app.db");
     migrateDatabase(databasePath);
@@ -130,7 +130,7 @@ describe("database migration interface", () => {
         '{"status":"applied"}',
         timestamp,
       );
-    database.pragma("user_version = 2");
+    database.pragma("user_version = 3");
     database.close();
 
     expect(() => migrateDatabase(databasePath)).toThrow(DatabaseResetRequiredError);

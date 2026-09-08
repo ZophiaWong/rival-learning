@@ -4,7 +4,17 @@ import {
   acceptNextQuestionCandidate,
   createAttackChainExecutionState,
 } from "@/server/core-loop/attack-chain-execution";
-import type { InterviewLanguage } from "@/server/core-loop/domain";
+import {
+  type BenchmarkBatch,
+  type InterviewLanguage,
+  type QuestionTurn,
+  type TurnEvaluation,
+} from "@/server/core-loop/domain";
+import {
+  materializeBenchmarkBatchCandidate,
+  materializeCheckpointReportCandidate,
+  materializeTurnEvaluationCandidate,
+} from "@/server/core-loop/checkpoint";
 import { materializeInterviewPlanCandidate } from "@/server/core-loop/grounding";
 import { createCoreLoopPolicySnapshot } from "@/server/core-loop/policy";
 import {
@@ -17,7 +27,7 @@ import type { ProviderViewContent } from "@/server/preparation-profiles";
 
 const liveTestsEnabled = process.env.RIVAL_RUN_LIVE_TESTS === "1";
 
-describe.skipIf(!liveTestsEnabled)("OpenRouter Step 3 live smoke", () => {
+describe.skipIf(!liveTestsEnabled)("OpenRouter Step 4 live smoke", () => {
   const config = parseServerConfig({
     ...process.env,
     RIVAL_DATABASE_PATH: process.env.RIVAL_DATABASE_PATH ?? ".data/live-smoke.db",
@@ -25,6 +35,7 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 3 live smoke", () => {
   });
   const interviewerStatus = getProviderConfigurationStatus(config).interviewer;
   const candidateStatus = getProviderConfigurationStatus(config).candidate;
+  const judgeStatus = getProviderConfigurationStatus(config).judge;
   const agents = createInterviewAgents(new OpenRouterRoleRunner(config));
   const policy = createCoreLoopPolicySnapshot();
 
@@ -40,6 +51,14 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 3 live smoke", () => {
     if (candidateStatus.status !== "configured") {
       throw new Error(
         `candidate provider configuration is ${candidateStatus.status}; missing: ${candidateStatus.missingFields.join(", ") || "none"}`,
+      );
+    }
+  }
+
+  function requireConfiguredJudge(): void {
+    if (judgeStatus.status !== "configured") {
+      throw new Error(
+        `judge provider configuration is ${judgeStatus.status}; missing: ${judgeStatus.missingFields.join(", ") || "none"}`,
       );
     }
   }
@@ -198,4 +217,179 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 3 live smoke", () => {
     expect(Array.from(result.value.text).length).toBeGreaterThan(0);
     expect(Array.from(result.value.text).length).toBeLessThanOrEqual(4_000);
   }, 120_000);
+
+  it("runs Judge evaluation, Candidate Benchmark, and Judge synthesis on synthetic data", async () => {
+    requireConfiguredJudge();
+    requireConfiguredCandidate();
+    const evidence =
+      "Synthetic candidate owned an idempotent retry rollout and reduced duplicate processing by 35%.";
+    const humanAnswerText =
+      "I would monitor duplicate rate and roll back if it increased.";
+    const questionContext = {
+      lines: [
+        {
+          source: "resume" as const,
+          lineNumber: 1,
+          text: evidence,
+          evidenceAnchorIds: ["synthetic-anchor-1"],
+        },
+      ],
+      totalLines: 1,
+      totalCharacters: evidence.length,
+    };
+    const humanTurn: QuestionTurn = {
+      id: "synthetic-human-turn-1",
+      ordinal: 1,
+      status: "settled",
+      question: {
+        text: "How would you validate the retry rollout?",
+        difficulty: "target",
+        evidenceAnchorIds: ["synthetic-anchor-1"],
+      },
+      normalizationKey: "how would you validate the retry rollout",
+      createdAt: "2026-09-06T08:00:00.000Z",
+      settledAt: "2026-09-06T08:01:00.000Z",
+      answer: {
+        actor: "human",
+        text: humanAnswerText,
+      },
+      generation: {
+        contractVersion: "interviewer-question-v1",
+        provider: "synthetic",
+        model: "synthetic",
+        usage: { requests: 0, inputTokens: 0, outputTokens: 0, usageComplete: true },
+      },
+    };
+
+    let evaluation: TurnEvaluation | null = null;
+    const evaluationRejections: string[] = [];
+    for (let candidate = 1; candidate <= policy.maxSemanticCandidatesPerOperation; candidate += 1) {
+      const result = await agents.evaluateHumanAnswer({
+        operationToken: "synthetic-evaluation",
+        interviewLanguage: "en-US",
+        rubricVersion: "answer-rubric-v1",
+        questionContext,
+        jobDescription: "Own reliable distributed backend systems.",
+        targetRole: "Backend Engineer",
+        targetLevel: "Senior",
+        knowledgeTarget: "Verify decision depth and measurable validation.",
+        currentTurn: {
+          id: humanTurn.id,
+          question: humanTurn.question.text,
+          answer: humanAnswerText,
+        },
+        priorPublicTranscript: [],
+        semanticRejections: evaluationRejections,
+      });
+      expect(result.status, "Judge evaluation provider call failed").toBe("success");
+      if (result.status !== "success") throw new Error(result.message);
+      const materialized = materializeTurnEvaluationCandidate({
+        turn: humanTurn,
+        candidate: result.value,
+        generation: result.generation,
+        rubricVersion: "answer-rubric-v1",
+        createdAt: "2026-09-06T08:02:00.000Z",
+      });
+      if (materialized.status === "accepted") {
+        evaluation = materialized.evaluation;
+        break;
+      }
+      evaluationRejections.push(materialized.reason);
+    }
+    expect(evaluation, `evaluation rejections: ${evaluationRejections.join(",")}`).not.toBeNull();
+    if (!evaluation) return;
+
+    let benchmarkBatch: BenchmarkBatch | null = null;
+    const benchmarkRejections: string[] = [];
+    for (let candidate = 1; candidate <= policy.maxSemanticCandidatesPerOperation; candidate += 1) {
+      const result = await agents.generateBenchmarks({
+        operationToken: "synthetic-benchmark",
+        interviewLanguage: "en-US",
+        questionContext,
+        jobDescription: "Own reliable distributed backend systems.",
+        targetRole: "Backend Engineer",
+        targetLevel: "Senior",
+        knowledgeTarget: "Verify decision depth and measurable validation.",
+        humanQuestions: [
+          {
+            turnId: humanTurn.id,
+            question: humanTurn.question.text,
+            evidenceAnchorIds: humanTurn.question.evidenceAnchorIds,
+          },
+        ],
+        semanticRejections: benchmarkRejections,
+      });
+      expect(result.status, "Candidate Benchmark provider call failed").toBe("success");
+      if (result.status !== "success") throw new Error(result.message);
+      const materialized = materializeBenchmarkBatchCandidate({
+        humanTurns: [humanTurn],
+        candidate: result.value,
+        generation: result.generation,
+        createdAt: "2026-09-06T08:03:00.000Z",
+      });
+      if (materialized.status === "accepted") {
+        benchmarkBatch = materialized.batch;
+        break;
+      }
+      benchmarkRejections.push(materialized.reason);
+    }
+    expect(benchmarkBatch, `benchmark rejections: ${benchmarkRejections.join(",")}`).not.toBeNull();
+    if (!benchmarkBatch) return;
+
+    const checkpointRejections: string[] = [];
+    let checkpointAccepted = false;
+    for (let candidate = 1; candidate <= policy.maxSemanticCandidatesPerOperation; candidate += 1) {
+      const result = await agents.generateCheckpointReport({
+        operationToken: "synthetic-checkpoint",
+        interviewLanguage: "en-US",
+        questionContext,
+        jobDescription: "Own reliable distributed backend systems.",
+        targetRole: "Backend Engineer",
+        targetLevel: "Senior",
+        knowledgeTarget: "Verify decision depth and measurable validation.",
+        humanTurns: [
+          {
+            turnId: humanTurn.id,
+            question: humanTurn.question.text,
+            answer: humanAnswerText,
+          },
+        ],
+        evaluations: [{ turnId: evaluation.turnId, dimensions: evaluation.dimensions }],
+        benchmarks: benchmarkBatch.benchmarks,
+        publicTranscript: [
+          { question: humanTurn.question.text, answer: humanTurn.answer },
+        ],
+        semanticRejections: checkpointRejections,
+      });
+      expect(result.status, "Judge synthesis provider call failed").toBe("success");
+      if (result.status !== "success") throw new Error(result.message);
+      const materialized = materializeCheckpointReportCandidate({
+        chainId: "synthetic-chain-1",
+        humanTurns: [humanTurn],
+        evaluations: [evaluation],
+        benchmarkBatch,
+        candidate: result.value,
+        generation: result.generation,
+        createId: () => "synthetic-finding-1",
+        completedAt: "2026-09-06T08:04:00.000Z",
+      });
+      if (materialized.status === "accepted") {
+        checkpointAccepted = true;
+        break;
+      }
+      checkpointRejections.push(materialized.reason);
+    }
+    console.log(
+      JSON.stringify({
+        scenario: "rubric-first-checkpoint",
+        judgeModel: judgeStatus.model,
+        candidateModel: candidateStatus.model,
+        evaluationRejections,
+        benchmarkRejections,
+        checkpointRejections,
+        checkpointAccepted,
+      }),
+    );
+    expect(checkpointAccepted).toBe(true);
+  }, 180_000);
 });

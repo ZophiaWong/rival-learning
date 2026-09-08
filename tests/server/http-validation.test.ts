@@ -100,6 +100,7 @@ describe("HTTP runtime validation", () => {
       "start",
       "request_ai_answer",
       "request_next_question",
+      "generate_checkpoint",
       "take_over",
     ]) {
       expect(sessionActionRequestSchema.safeParse({ type }).success).toBe(true);
@@ -121,6 +122,12 @@ describe("HTTP runtime validation", () => {
     ).toBe(false);
     expect(
       sessionActionRequestSchema.safeParse({ type: "take_over", answer: "unexpected" }).success,
+    ).toBe(false);
+    expect(
+      sessionActionRequestSchema.safeParse({
+        type: "generate_checkpoint",
+        calibration: "accurate",
+      }).success,
     ).toBe(false);
 
     const response = await runSessionAction(

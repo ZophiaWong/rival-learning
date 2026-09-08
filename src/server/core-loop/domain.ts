@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { CORE_LOOP_V2_POLICY } from "./policy";
+import { CORE_LOOP_V3_POLICY } from "./policy";
 
 export const interviewLanguageSchema = z.enum(["zh-CN", "en-US"]);
 export type InterviewLanguage = z.infer<typeof interviewLanguageSchema>;
@@ -29,7 +29,7 @@ function boundedUserText(maximum: number) {
 
 export const difficultyBasisSchema = z.strictObject({
   signals: z.array(difficultySignalSchema).min(1).max(5),
-  explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.difficultyExplanation),
+  explanation: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.difficultyExplanation),
 });
 export type DifficultyBasis = z.infer<typeof difficultyBasisSchema>;
 
@@ -58,21 +58,21 @@ export const requestedEvidenceKindSchema = z.enum([
 
 export const requestedEvidenceSchema = z.strictObject({
   kind: requestedEvidenceKindSchema,
-  prompt: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.requestedEvidencePrompt),
+  prompt: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.requestedEvidencePrompt),
 });
 export type RequestedEvidence = z.infer<typeof requestedEvidenceSchema>;
 
 export const readyAttackChainCandidateSchema = z.strictObject({
   status: z.literal("ready"),
   intent: z.literal("ownership_claim_depth"),
-  knowledgeTarget: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.knowledgeTarget),
+  knowledgeTarget: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.knowledgeTarget),
   evidenceAnchors: z
     .array(rawEvidenceAnchorSchema)
     .min(1)
-    .max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
+    .max(CORE_LOOP_V3_POLICY.maxEvidenceAnchors),
   initialDifficulty: difficultySchema,
   difficultyBasis: difficultyBasisSchema,
-  estimatedDepth: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
+  estimatedDepth: z.number().int().min(1).max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
 });
 
 export const needsInputAttackChainCandidateSchema = z.strictObject({
@@ -82,7 +82,7 @@ export const needsInputAttackChainCandidateSchema = z.strictObject({
   requestedEvidence: z
     .array(requestedEvidenceSchema)
     .min(1)
-    .max(CORE_LOOP_V2_POLICY.maxRequestedEvidenceItems),
+    .max(CORE_LOOP_V3_POLICY.maxRequestedEvidenceItems),
 });
 
 export const attackChainCandidateSchema = z.discriminatedUnion("status", [
@@ -98,7 +98,7 @@ export const readyAttackChainSchema = readyAttackChainCandidateSchema.omit({
   evidenceAnchors: z
     .array(evidenceAnchorSchema)
     .min(1)
-    .max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
+    .max(CORE_LOOP_V3_POLICY.maxEvidenceAnchors),
 });
 
 export const needsInputAttackChainSchema = needsInputAttackChainCandidateSchema.extend({
@@ -133,6 +133,9 @@ export const generationMetadataSchema = z.strictObject({
     "interview-plan-v1",
     "interviewer-question-v1",
     "candidate-answer-v1",
+    "judge-turn-evaluation-v1",
+    "candidate-benchmark-v1",
+    "judge-checkpoint-v1",
   ]),
   provider: z.string().min(1).nullable(),
   model: z.string().min(1).nullable(),
@@ -154,8 +157,8 @@ export const contextLineSchema = z.strictObject({
 
 export const questionContextPacketSchema = z.strictObject({
   lines: z.array(contextLineSchema).min(1),
-  totalLines: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionContextLines),
-  totalCharacters: z.number().int().min(0).max(CORE_LOOP_V2_POLICY.maxQuestionContextChars),
+  totalLines: z.number().int().min(1).max(CORE_LOOP_V3_POLICY.maxQuestionContextLines),
+  totalCharacters: z.number().int().min(0).max(CORE_LOOP_V3_POLICY.maxQuestionContextChars),
 });
 export type QuestionContextPacket = z.infer<typeof questionContextPacketSchema>;
 
@@ -167,9 +170,9 @@ export const interviewPlanRecordSchema = z.strictObject({
 export type InterviewPlanRecord = z.infer<typeof interviewPlanRecordSchema>;
 
 export const proposedQuestionSchema = z.strictObject({
-  text: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.question),
+  text: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.question),
   difficulty: difficultySchema,
-  evidenceAnchorIds: z.array(z.string().min(1)).min(1).max(CORE_LOOP_V2_POLICY.maxEvidenceAnchors),
+  evidenceAnchorIds: z.array(z.string().min(1)).min(1).max(CORE_LOOP_V3_POLICY.maxEvidenceAnchors),
 });
 export type ProposedQuestion = z.infer<typeof proposedQuestionSchema>;
 
@@ -178,17 +181,167 @@ export const nextQuestionCandidateSchema = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("complete"),
     code: z.enum(["knowledge_target_satisfied", "no_grounded_followup"]),
-    explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.completionExplanation),
+    explanation: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.completionExplanation),
   }),
 ]);
 export type NextQuestionCandidate = z.infer<typeof nextQuestionCandidateSchema>;
 
-export const answerTextSchema = boundedUserText(CORE_LOOP_V2_POLICY.textLimits.answer);
+export const answerTextSchema = boundedUserText(CORE_LOOP_V3_POLICY.textLimits.answer);
 
 export const candidateAnswerSchema = z.strictObject({
   text: answerTextSchema,
 });
 export type CandidateAnswer = z.infer<typeof candidateAnswerSchema>;
+
+export const RUBRIC_DIMENSIONS = [
+  "answer_relevance",
+  "ownership_scope",
+  "decision_reasoning",
+  "evidence_and_outcome",
+  "target_level_depth",
+] as const;
+
+export const rubricDimensionSchema = z.enum(RUBRIC_DIMENSIONS);
+export type RubricDimension = z.infer<typeof rubricDimensionSchema>;
+
+export const rubricVerdictSchema = z.enum([
+  "met",
+  "partial",
+  "missing",
+  "not_applicable",
+]);
+export type RubricVerdict = z.infer<typeof rubricVerdictSchema>;
+
+function rubricResultSchema<D extends RubricDimension>(dimension: D) {
+  return z.strictObject({
+    dimension: z.literal(dimension),
+    verdict: rubricVerdictSchema,
+    rationale: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.checkpointRationale),
+    answerExcerpts: z
+      .array(boundedUserText(CORE_LOOP_V3_POLICY.textLimits.evidenceExcerpt))
+      .max(2),
+  });
+}
+
+export const turnEvaluationCandidateSchema = z.strictObject({
+  dimensions: z.tuple([
+    rubricResultSchema("answer_relevance"),
+    rubricResultSchema("ownership_scope"),
+    rubricResultSchema("decision_reasoning"),
+    rubricResultSchema("evidence_and_outcome"),
+    rubricResultSchema("target_level_depth"),
+  ]),
+});
+export type TurnEvaluationCandidate = z.infer<typeof turnEvaluationCandidateSchema>;
+export type RubricResult = TurnEvaluationCandidate["dimensions"][number];
+
+export const answerRubricVersionSchema = z.literal("answer-rubric-v1");
+
+export const judgeEvaluationGenerationMetadataSchema = generationMetadataSchema.refine(
+  (generation) => generation.contractVersion === "judge-turn-evaluation-v1",
+  { message: "Turn evaluations require judge-turn-evaluation-v1 generation metadata" },
+);
+
+export const turnEvaluationSchema = z.strictObject({
+  turnId: z.string().min(1),
+  rubricVersion: answerRubricVersionSchema,
+  dimensions: turnEvaluationCandidateSchema.shape.dimensions,
+  generation: judgeEvaluationGenerationMetadataSchema,
+  createdAt: z.iso.datetime(),
+});
+export type TurnEvaluation = z.infer<typeof turnEvaluationSchema>;
+
+export const benchmarkCandidateSchema = z.strictObject({
+  turnId: z.string().min(1),
+  text: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.benchmark),
+  evidenceAnchorIds: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(CORE_LOOP_V3_POLICY.maxEvidenceAnchors),
+});
+export type BenchmarkCandidate = z.infer<typeof benchmarkCandidateSchema>;
+export type Benchmark = BenchmarkCandidate;
+
+export const benchmarkBatchCandidateSchema = z.strictObject({
+  benchmarks: z
+    .array(benchmarkCandidateSchema)
+    .min(1)
+    .max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+});
+export type BenchmarkBatchCandidate = z.infer<typeof benchmarkBatchCandidateSchema>;
+
+export const candidateBenchmarkGenerationMetadataSchema = generationMetadataSchema.refine(
+  (generation) => generation.contractVersion === "candidate-benchmark-v1",
+  { message: "Benchmark batches require candidate-benchmark-v1 generation metadata" },
+);
+
+export const benchmarkBatchSchema = benchmarkBatchCandidateSchema.extend({
+  generation: candidateBenchmarkGenerationMetadataSchema,
+  createdAt: z.iso.datetime(),
+});
+export type BenchmarkBatch = z.infer<typeof benchmarkBatchSchema>;
+
+export const turnDifferenceCandidateSchema = z.strictObject({
+  dimension: rubricDimensionSchema,
+  explanation: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.checkpointRationale),
+  answerExcerpt: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.evidenceExcerpt).nullable(),
+  benchmarkExcerpt: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.evidenceExcerpt),
+});
+export type TurnDifference = z.infer<typeof turnDifferenceCandidateSchema>;
+
+export const turnComparisonCandidateSchema = z.strictObject({
+  turnId: z.string().min(1),
+  differences: z.array(turnDifferenceCandidateSchema).max(RUBRIC_DIMENSIONS.length),
+});
+export type TurnComparison = z.infer<typeof turnComparisonCandidateSchema>;
+
+export const gapFindingCandidateSchema = z.strictObject({
+  targetDimension: rubricDimensionSchema,
+  summary: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.findingSummary),
+  basis: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.checkpointRationale),
+  sourceTurnIds: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+});
+
+export const checkpointReportCandidateSchema = z.strictObject({
+  comparisons: z
+    .array(turnComparisonCandidateSchema)
+    .max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+  findings: z.array(gapFindingCandidateSchema).max(3),
+});
+export type CheckpointReportCandidate = z.infer<typeof checkpointReportCandidateSchema>;
+
+export const judgeCheckpointGenerationMetadataSchema = generationMetadataSchema.refine(
+  (generation) => generation.contractVersion === "judge-checkpoint-v1",
+  { message: "Checkpoints require judge-checkpoint-v1 generation metadata" },
+);
+
+export const gapFindingSchema = gapFindingCandidateSchema.extend({
+  id: z.string().min(1),
+  priority: z.union([z.literal(1), z.literal(2), z.literal(3)]),
+  calibration: z.literal("unreviewed"),
+});
+export type GapFinding = z.infer<typeof gapFindingSchema>;
+
+export const checkpointSchema = z.strictObject({
+  status: z.literal("completed"),
+  chainId: z.string().min(1),
+  evaluations: z
+    .array(turnEvaluationSchema)
+    .min(1)
+    .max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+  benchmarkBatch: benchmarkBatchSchema,
+  comparisons: z
+    .array(turnComparisonCandidateSchema)
+    .min(1)
+    .max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+  findings: z.array(gapFindingSchema).max(3),
+  generation: judgeCheckpointGenerationMetadataSchema,
+  completedAt: z.iso.datetime(),
+});
+export type Checkpoint = z.infer<typeof checkpointSchema>;
 
 const recordedAnswerSchema = z.discriminatedUnion("actor", [
   z.strictObject({
@@ -204,7 +357,7 @@ export type AnswerMode = z.infer<typeof answerModeSchema>;
 
 export const questionTurnSchema = z.strictObject({
   id: z.string().min(1),
-  ordinal: z.number().int().min(1).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
+  ordinal: z.number().int().min(1).max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
   status: z.enum(["awaiting_answer", "settled"]),
   question: proposedQuestionSchema,
   normalizationKey: z.string().min(1),
@@ -221,7 +374,7 @@ export const attackChainCompletionSchema = z.strictObject({
     "knowledge_target_satisfied",
     "no_grounded_followup",
   ]),
-  explanation: boundedUserText(CORE_LOOP_V2_POLICY.textLimits.completionExplanation),
+  explanation: boundedUserText(CORE_LOOP_V3_POLICY.textLimits.completionExplanation),
   completedAt: z.iso.datetime(),
 });
 export type AttackChainCompletion = z.infer<typeof attackChainCompletionSchema>;
@@ -230,8 +383,8 @@ export const attackChainExecutionStateSchema = z.strictObject({
   chainId: z.string().min(1),
   answerMode: answerModeSchema,
   status: z.enum(["awaiting_answer", "ready_for_next_question", "completed"]),
-  turns: z.array(questionTurnSchema).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
-  normalizedQuestionKeys: z.array(z.string().min(1)).max(CORE_LOOP_V2_POLICY.maxQuestionTurns),
+  turns: z.array(questionTurnSchema).max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
+  normalizedQuestionKeys: z.array(z.string().min(1)).max(CORE_LOOP_V3_POLICY.maxQuestionTurns),
   completion: attackChainCompletionSchema.nullable(),
 });
 export type AttackChainExecutionState = z.infer<typeof attackChainExecutionStateSchema>;

@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { dirname, parse, resolve } from "node:path";
 
-export const DATABASE_EPOCH = 3;
+export const DATABASE_EPOCH = 4;
 export const DATABASE_RESET_CONFIRMATION = "--confirm-reset";
 
 const APPLICATION_TABLES = [

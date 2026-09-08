@@ -2,14 +2,21 @@ import { z } from "zod";
 
 import {
   answerTextSchema,
+  candidateBenchmarkGenerationMetadataSchema,
   candidateAnswerGenerationMetadataSchema,
   generationMetadataSchema,
   generationUsageSchema,
   interviewLanguageSchema,
   interviewPlanSchema,
+  judgeCheckpointGenerationMetadataSchema,
+  judgeEvaluationGenerationMetadataSchema,
   publicQuestionTurnSchema,
 } from "@/server/core-loop/domain";
-import { sessionOperationSchema } from "./state";
+import {
+  checkpointStageSchema,
+  publicCheckpointSchema,
+  sessionOperationSchema,
+} from "./state";
 
 const timelineEnvelope = {
   sequence: z.number().int().min(1),
@@ -94,6 +101,34 @@ export const timelineEventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     ...timelineEnvelope,
+    type: z.literal("turn_evaluation_recorded"),
+    payload: z.strictObject({
+      chainId: z.string().min(1),
+      turnId: z.string().min(1),
+      rubricVersion: z.literal("answer-rubric-v1"),
+      generation: judgeEvaluationGenerationMetadataSchema,
+    }),
+  }),
+  z.strictObject({
+    ...timelineEnvelope,
+    type: z.literal("benchmarks_generated"),
+    payload: z.strictObject({
+      chainId: z.string().min(1),
+      turnIds: z.array(z.string().min(1)).min(1).max(4),
+      count: z.number().int().min(1).max(4),
+      generation: candidateBenchmarkGenerationMetadataSchema,
+    }),
+  }),
+  z.strictObject({
+    ...timelineEnvelope,
+    type: z.literal("checkpoint_generated"),
+    payload: z.strictObject({
+      checkpoint: publicCheckpointSchema,
+      generation: judgeCheckpointGenerationMetadataSchema,
+    }),
+  }),
+  z.strictObject({
+    ...timelineEnvelope,
     type: z.literal("operation_failed"),
     payload: z.strictObject({
       operation: sessionOperationSchema,
@@ -103,6 +138,7 @@ export const timelineEventSchema = z.discriminatedUnion("type", [
       usage: generationUsageSchema,
       rejectionCounts: z.record(z.string(), z.number().int().min(1)),
       lastRejectionReason: z.string().min(1).nullable(),
+      stage: checkpointStageSchema.nullable().default(null),
     }),
   }),
 ]);
