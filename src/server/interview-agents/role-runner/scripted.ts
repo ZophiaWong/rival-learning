@@ -1,3 +1,4 @@
+import { requestAccounting, budgetExhaustedResult } from "./accounting";
 import {
   abortedRoleRunResult,
   aggregateRoleRunUsage,
@@ -46,7 +47,7 @@ export class ScriptedRoleRunner implements RoleRunner {
       return abortedRoleRunResult();
     }
 
-    const queuedStep = this.steps.shift();
+    const queuedStep = this.steps[0];
     if (!queuedStep) {
       return {
         status: "failure" as const,
@@ -59,13 +60,34 @@ export class ScriptedRoleRunner implements RoleRunner {
       };
     }
 
+    const accounting = requestAccounting.getStore();
+    const receipt = accounting?.reserve();
+    if (receipt === null) return budgetExhaustedResult();
+    this.steps.shift();
+
     const step =
       typeof queuedStep === "function"
         ? await queuedStep(request as RoleRunRequest<unknown>)
         : queuedStep;
 
     const attempts = [...(step.attempts ?? [])];
-    const usage = step.usage ?? aggregateRoleRunUsage(attempts);
+    const usage = { ...(step.usage ?? aggregateRoleRunUsage(attempts)) };
+    if (receipt) usage.requests = Math.max(1, usage.requests);
+    if (receipt) {
+      const count = Math.max(1, usage.requests);
+      for (let index = 0; index < count; index += 1) {
+        const id = index === 0 ? receipt : accounting!.reserve();
+        if (id === null) {
+          const consumedAttempts = attempts.slice(0, index);
+          return { ...budgetExhaustedResult(), attempts: consumedAttempts,
+            usage: attempts.length ? aggregateRoleRunUsage(consumedAttempts) : { ...usage, requests: index } };
+        }
+        const attempt = attempts[index];
+        accounting!.settle(id,
+          attempt ? attempt.inputTokens : (index === 0 ? usage.inputTokens : 0),
+          attempt ? attempt.outputTokens : (index === 0 ? usage.outputTokens : 0));
+      }
+    }
     let outputDelivered = false;
 
     if (step.status === "await_abort") {

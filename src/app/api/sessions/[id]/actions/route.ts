@@ -17,10 +17,7 @@ export async function POST(request: Request, context: RouteContext) {
     const { id } = await context.params;
     const body = await parseJsonRequest(request, sessionActionRequestSchema);
     const idempotencyKey = parseIdempotencyKey(request);
-    const command =
-      body.type === "submit_human_answer"
-        ? { ...body, sessionId: id, idempotencyKey }
-        : { type: body.type, sessionId: id, idempotencyKey };
+    const command = { ...body, sessionId: id, idempotencyKey };
     const result = await getApplication().sessionEngine.dispatch(command);
     return NextResponse.json(result, { status: result.status === "rejected" ? 409 : 200 });
   } catch (error) {

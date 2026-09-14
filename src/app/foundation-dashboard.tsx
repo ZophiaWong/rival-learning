@@ -11,6 +11,10 @@ import type { SessionView, TimelineEvent } from "@/server/session-engine";
 import type { InterviewLanguage } from "@/server/core-loop/domain";
 
 type SessionAction =
+  | { type: "calibrate_finding"; findingId: string; calibration: "accurate" | "partial" | "inaccurate" }
+  | { type: "add_reflection"; turnId: string; text: string }
+  | { type: "submit_rechallenge_answer"; answer: string }
+
   | {
       type:
         | "generate_plan"
@@ -18,7 +22,8 @@ type SessionAction =
         | "request_ai_answer"
         | "request_next_question"
         | "generate_checkpoint"
-        | "take_over";
+        | "take_over"
+        | "prepare_rechallenge" | "evaluate_rechallenge" | "generate_hint" | "skip_rechallenge" | "finish_rechallenge" | "extend_budget" | "resume_error";
     }
   | { type: "submit_human_answer"; answer: string };
 
@@ -82,6 +87,8 @@ export function FoundationDashboard() {
   const [pendingOperation, setPendingOperation] = useState<SessionAction["type"] | null>(null);
   const [takeOverConfirmationTurnId, setTakeOverConfirmationTurnId] = useState<string | null>(null);
   const [humanAnswer, setHumanAnswer] = useState("");
+  const [rechallengeAnswer, setRechallengeAnswer] = useState("");
+  const [reflections, setReflections] = useState<Record<string, string>>({});
   const initialLoad = useRef<
     Promise<[{ profiles: PreparationProfile[] }, { sessions: SessionView[] }]> | null
   >(null);
@@ -139,6 +146,11 @@ export function FoundationDashboard() {
   useEffect(() => {
     if (!selectedSessionId) return;
     const source = new EventSource(`/api/sessions/${selectedSessionId}/events`);
+    let cancelled = false;
+    const refreshState = () => { void requestJson<{ session: SessionView }>(`/api/sessions/${selectedSessionId}`).then(({ session }) => {
+      if (!cancelled) setSessions(current => current.map(item => item.id === session.id && item.version <= session.version ? session : item));
+    }).catch(() => { /* EventSource reconnect will retry state synchronization. */ }); };
+    source.addEventListener("open", refreshState);
     const receiveTimelineEvent = (message: Event) => {
       if (!(message instanceof MessageEvent)) return;
       try {
@@ -147,12 +159,15 @@ export function FoundationDashboard() {
           return;
         }
         setTimeline((current) => mergeTimelineEvents(current, [nextEvent]));
+        refreshState();
       } catch {
         // A malformed public event is ignored; reconnect or a detail refresh restores state.
       }
     };
     source.addEventListener("timeline", receiveTimelineEvent);
     return () => {
+      cancelled = true;
+      source.removeEventListener("open", refreshState);
       source.removeEventListener("timeline", receiveTimelineEvent);
       source.close();
     };
@@ -359,6 +374,16 @@ export function FoundationDashboard() {
       setTakeOverConfirmationTurnId(null);
       setHumanAnswer("");
       const successMessage: Record<SessionAction["type"], string> = {
+        calibrate_finding: "校准已保存。",
+        add_reflection: "复盘已追加；原回答与评价保持不变。",
+        submit_rechallenge_answer: "回答已保存，正在评价。",
+        prepare_rechallenge: "解释与新情境问题已准备好。",
+        evaluate_rechallenge: "Rechallenge 评价已保存。",
+        generate_hint: "L1 提示已展示，可以再作答一次。",
+        skip_rechallenge: "已暂缓本次 Rechallenge。",
+        finish_rechallenge: "本次结果记录为 unresolved。",
+        extend_budget: "预算增加 20 次。",
+        resume_error: "正在恢复操作。",
         generate_plan: "InterviewPlan 已生成。",
         start: "Session 已启动并展示首题。",
         request_ai_answer: "Candidate 回答已保存；由你决定何时继续追问。",
@@ -370,6 +395,14 @@ export function FoundationDashboard() {
           : "回答已保存；由你决定何时继续追问。",
       };
       setMessage(successMessage[action.type]);
+      if (action.type === "submit_rechallenge_answer") {
+        setRechallengeAnswer("");
+        await runSessionAction({ type: "evaluate_rechallenge" });
+      } else if (action.type === "resume_error" && selectedSession?.state.failedOperation) {
+        await runSessionAction({ type: selectedSession.state.failedOperation.type });
+      } else if (action.type === "add_reflection") {
+        setReflections(current => ({ ...current, [action.turnId]: "" }));
+      }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Session action 失败");
       try {
@@ -386,6 +419,16 @@ export function FoundationDashboard() {
   const selectedSession = sessions.find((session) => session.id === selectedSessionId) ?? null;
   const visibleOperation = pendingOperation ?? selectedSession?.state.activeOperation ?? null;
   const actionDisabled = busy || visibleOperation !== null;
+  useEffect(() => {
+    if (!selectedSessionId || !visibleOperation) return;
+    let cancelled = false;
+    const timer = setInterval(() => {
+      void requestJson<{ session: SessionView }>(`/api/sessions/${selectedSessionId}`).then(({ session }) => {
+        if (!cancelled) setSessions(current => current.map(item => item.id === session.id && item.version <= session.version ? session : item));
+      }).catch(() => { /* The next polling tick or SSE event can restore state. */ });
+    }, 2000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [selectedSessionId, visibleOperation]);
   const humanTurnCount =
     selectedSession?.state.execution?.turns.filter(
       (turn) => turn.answer?.actor === "human",
@@ -675,6 +718,10 @@ export function FoundationDashboard() {
                 </ul>
               </div>
             ) : null}
+            <p className="rounded-lg bg-slate-100 p-3 text-sm" aria-label="Session usage">
+              请求 {selectedSession.usage.requests} / {selectedSession.usage.limit} · 输入 tokens {selectedSession.usage.inputTokens} · 输出 tokens {selectedSession.usage.outputTokens}
+              {!selectedSession.usage.usageComplete ? "（部分请求的 token 用量未知）" : ""}
+            </p>
             {visibleOperation ? (
               <p
                 className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
@@ -692,21 +739,11 @@ export function FoundationDashboard() {
                 {selectedSession.state.failedOperation.type === "request_ai_answer" ? (
                   <p className="mt-1">Candidate 生成失败；当前问题仍可由你 Take Over。</p>
                 ) : null}
-                {selectedSession.state.failedOperation.type === "request_next_question" ? (
-                  <p className="mt-1">
-                    本版本不能恢复失败的追问 operation。请从已确认的 Profile 新建 Session。
-                  </p>
-                ) : null}
-                {selectedSession.state.failedOperation.type === "generate_checkpoint" ? (
-                  <p className="mt-1">
-                    Checkpoint 在
-                    {selectedSession.state.failedOperation.stage
-                      ? ` ${selectedSession.state.failedOperation.stage} `
-                      : "未知"}
-                    阶段失败；本版本不公开半成品，也不能恢复。请从已确认的 Profile 新建
-                    Session。
-                  </p>
-                ) : null}
+                {selectedSession.status === "budget_paused" ? (
+                  <button className="mt-2 rounded-lg border px-3 py-2" disabled={actionDisabled} onClick={() => void runSessionAction({ type: "extend_budget" })}>增加 20 次预算</button>
+                ) : (
+                  <button className="mt-2 rounded-lg border px-3 py-2" disabled={actionDisabled} onClick={() => void runSessionAction({ type: "resume_error" })}>恢复并继续</button>
+                )}
               </div>
             ) : null}
             {selectedSession.state.execution?.turns.map((turn, index, turns) => {
@@ -736,6 +773,14 @@ export function FoundationDashboard() {
                       </p>
                       <p className="mt-1 whitespace-pre-wrap">{turn.answer.text}</p>
                     </div>
+                  ) : null}
+                  {turn.answer?.actor === "human" ? (
+                    <details className="mt-3 text-sm">
+                      <summary className="cursor-pointer">追加自我复盘</summary>
+                      {timeline.filter(event => event.type === "reflection_added" && event.payload.turnId === turn.id).map(event => event.type === "reflection_added" ? <p className="my-2 whitespace-pre-wrap" key={event.sequence}>{event.payload.text}</p> : null)}
+                      <textarea aria-label={`Question ${turn.ordinal} Reflection`} className="mt-2 w-full rounded border p-2" value={reflections[turn.id] ?? ""} onChange={event => setReflections(current => ({ ...current, [turn.id]: event.target.value }))} />
+                      <button disabled={actionDisabled || !(reflections[turn.id] ?? "").trim()} className="rounded border px-3 py-2" onClick={() => void runSessionAction({ type: "add_reflection", turnId: turn.id, text: reflections[turn.id] })}>保存复盘</button>
+                    </details>
                   ) : null}
                   {isPending && execution.answerMode === "a2a" ? (
                     <div className="mt-4 grid gap-3">
@@ -928,6 +973,9 @@ export function FoundationDashboard() {
                             Priority {finding.priority} · {finding.targetDimension} · {finding.calibration}
                           </p>
                           <p className="mt-1">{finding.summary}</p>
+                          {finding.calibration === "unreviewed" ? <div className="mt-2 flex gap-2">
+                            {([ ["accurate", "准确"], ["partial", "部分准确"], ["inaccurate", "不准确"] ] as const).map(([calibration, label]) => <button key={calibration} disabled={actionDisabled || selectedSession.status !== "active"} className="rounded border border-fuchsia-300 bg-white px-3 py-2" onClick={() => void runSessionAction({ type: "calibrate_finding", findingId: finding.id, calibration })}>{label}</button>)}
+                          </div> : null}
                           <p className="mt-1 text-xs text-slate-700">依据：{finding.basis}</p>
                           <p className="mt-1 text-xs text-slate-700">
                             来源问题：
@@ -974,8 +1022,43 @@ export function FoundationDashboard() {
                   </p>
                 ) : null}
                 <p className="text-xs text-slate-600">
-                  所有 GapFinding 当前均为 unreviewed；Step 5 才能校准。
+                  请逐项校准差距；只针对你接受的差距进行训练。
                 </p>
+              </section>
+            ) : null}
+            {selectedSession.state.checkpoint && selectedSession.state.checkpoint.findings.every(f => f.calibration !== "unreviewed") ? (
+              <section aria-label="Rechallenge" className="grid gap-3 rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-sm">
+                <h3 className="text-lg font-semibold">即时 Rechallenge</h3>
+                {selectedSession.state.learning.gaps.length === 0 ? <p>没有已接受的差距，本次复盘完成。</p> : !selectedSession.state.learning.rechallenge ? (
+                  <><p>针对最高优先级的已接受差距，先阅读简短解释，再尝试新情境。</p><button disabled={actionDisabled || selectedSession.status !== "active"} className="rounded-lg border bg-white px-3 py-2" onClick={() => void runSessionAction({ type: "prepare_rechallenge" })}>开始即时 Rechallenge</button></>
+                ) : (() => {
+                  const challenge = selectedSession.state.learning.rechallenge;
+                  const last = challenge.attempts.at(-1);
+                  const disabled = actionDisabled || selectedSession.status !== "active";
+                  return <>
+                    <p className="whitespace-pre-wrap"><strong>简短解释：</strong>{challenge.preparation.microExplanation}</p>
+                    <p className="text-xs text-slate-600">新情境：{challenge.preparation.scenarioChange}</p>
+                    <p className="text-base font-medium">{challenge.preparation.question}</p>
+                    {challenge.attempts.map((attempt, index) => <div key={index} className="rounded-lg bg-white p-3">
+                      <p className="font-semibold">{attempt.hinted ? "L1 提示后回答" : "第一次无提示回答"}</p>
+                      <p className="whitespace-pre-wrap">{attempt.answer}</p>
+                      {attempt.evaluation ? <p className="mt-2">{attempt.evaluation.covered ? "已覆盖目标维度" : "尚未覆盖目标维度"}：{attempt.evaluation.explanation}</p> : <button disabled={disabled} className="mt-2 rounded border px-3 py-2" onClick={() => void runSessionAction({ type: "evaluate_rechallenge" })}>评价已保存的回答</button>}
+                    </div>)}
+                    {challenge.hint ? <p className="rounded-lg bg-amber-100 p-3">L1 提示：{challenge.hint}</p> : null}
+                    {challenge.outcome ? <p className="font-semibold">结果：{challenge.outcome}</p> : <>
+                      {(!last || (last.evaluation && challenge.hint && challenge.attempts.length < 2)) ? <form onSubmit={event => { event.preventDefault(); void runSessionAction({ type: "submit_rechallenge_answer", answer: rechallengeAnswer }); }} className="grid gap-2">
+                        <label htmlFor="rechallenge-answer">{challenge.hint ? "提示后再作答" : "无提示作答"}</label>
+                        <textarea id="rechallenge-answer" className="min-h-28 rounded-lg border p-3" value={rechallengeAnswer} onChange={event => setRechallengeAnswer(event.target.value)} disabled={disabled} />
+                        <button className="rounded-lg bg-[var(--accent)] px-3 py-2 text-white disabled:opacity-40" disabled={disabled || !rechallengeAnswer.trim()}>提交 Rechallenge 回答</button>
+                      </form> : null}
+                      {last?.evaluation && !last.evaluation.covered && !challenge.hint ? <div className="flex gap-2">
+                        <button className="rounded border bg-white px-3 py-2" disabled={disabled} onClick={() => void runSessionAction({ type: "generate_hint" })}>使用一次 L1 提示</button>
+                        <button className="rounded border bg-white px-3 py-2" disabled={disabled} onClick={() => void runSessionAction({ type: "finish_rechallenge" })}>结束并记录未解决</button>
+                      </div> : null}
+                      {(!last || last.evaluation) ? <button className="justify-self-start rounded border px-3 py-2" disabled={disabled} onClick={() => void runSessionAction({ type: "skip_rechallenge" })}>暂缓 Rechallenge</button> : null}
+                    </>}
+                  </>;
+                })()}
               </section>
             ) : null}
             <ol className="grid gap-2 text-sm" aria-label="Session timeline">

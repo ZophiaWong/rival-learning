@@ -136,6 +136,7 @@ export const generationMetadataSchema = z.strictObject({
     "judge-turn-evaluation-v1",
     "candidate-benchmark-v1",
     "judge-checkpoint-v1",
+    "rechallenge-v1",
   ]),
   provider: z.string().min(1).nullable(),
   model: z.string().min(1).nullable(),
@@ -321,7 +322,7 @@ export const judgeCheckpointGenerationMetadataSchema = generationMetadataSchema.
 export const gapFindingSchema = gapFindingCandidateSchema.extend({
   id: z.string().min(1),
   priority: z.union([z.literal(1), z.literal(2), z.literal(3)]),
-  calibration: z.literal("unreviewed"),
+  calibration: z.enum(["unreviewed", "accurate", "partial", "inaccurate"]),
 });
 export type GapFinding = z.infer<typeof gapFindingSchema>;
 

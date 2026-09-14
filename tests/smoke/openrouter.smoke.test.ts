@@ -392,4 +392,29 @@ describe.skipIf(!liveTestsEnabled)("OpenRouter Step 4 live smoke", () => {
     );
     expect(checkpointAccepted).toBe(true);
   }, 180_000);
+  it("Step 5 learning operations accept synthetic input", async () => {
+    requireConfiguredInterviewer();
+    requireConfiguredJudge();
+    const common = { interviewLanguage: "en-US" as const, targetRole: "Backend Engineer", targetLevel: "Senior",
+      targetDimension: "evidence_and_outcome" as const };
+    const evidence = "Synthetic candidate owned a queue migration.";
+    const prepared = await agents.prepareRechallenge({ ...common, findingSummary: "Validate decisions with measurable outcomes.",
+      originalQuestions: ["How did you validate your queue migration?"],
+      evidenceContext: { lines: [{ source: "resume", lineNumber: 1, text: evidence, evidenceAnchorIds: ["synthetic-1"] }], totalLines: 1, totalCharacters: evidence.length },
+    });
+    expect(prepared.status).toBe("success");
+    if (prepared.status !== "success") return;
+    expect(prepared.value.targetDimension).toBe(common.targetDimension);
+    const question = prepared.value.question;
+    const answer = "I would compare failure rate and p95 latency against the pre-rollout baseline using equivalent traffic over fixed windows, define rollback thresholds in advance, and report the observed before/after change.";
+    const evaluated = await agents.evaluateRechallenge({ ...common, question, answer });
+    expect(evaluated.status).toBe("success");
+    if (evaluated.status !== "success") return;
+    expect(evaluated.value.answerExcerpts.every(excerpt => answer.includes(excerpt))).toBe(true);
+    const hinted = await agents.generateHint({ ...common, question });
+    expect(hinted.status).toBe("success");
+    console.info(JSON.stringify({ operation: "learning_smoke", preparation: prepared.generation,
+      evaluation: evaluated.generation, hint: hinted.generation }));
+  }, 300_000);
+
 });

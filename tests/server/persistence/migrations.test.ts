@@ -40,6 +40,7 @@ describe("database migration interface", () => {
 
     expect(tables).toEqual([
       "idempotency_results",
+      "model_requests",
       "preparation_profiles",
       "provider_views",
       "session_timeline",

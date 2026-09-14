@@ -1,3 +1,4 @@
+import { calibrationSchema, learningStateSchema } from "@/server/core-loop/learning";
 import { z } from "zod";
 
 import {
@@ -24,6 +25,11 @@ const timelineEnvelope = {
 };
 
 export const timelineEventSchema = z.discriminatedUnion("type", [
+  z.strictObject({ ...timelineEnvelope, type: z.literal("finding_calibrated"), payload: z.strictObject({ findingId: z.string().min(1), calibration: calibrationSchema }) }),
+  z.strictObject({ ...timelineEnvelope, type: z.literal("learning_updated"), payload: z.strictObject({ action: z.string().min(1), learning: learningStateSchema, generation: generationMetadataSchema.optional() }) }),
+  z.strictObject({ ...timelineEnvelope, type: z.literal("reflection_added"), payload: z.strictObject({ turnId: z.string().min(1), text: answerTextSchema }) }),
+  z.strictObject({ ...timelineEnvelope, type: z.literal("budget_extended"), payload: z.strictObject({ limit: z.number().int().min(80), added: z.literal(20) }) }),
+  z.strictObject({ ...timelineEnvelope, type: z.literal("operation_resumed"), payload: z.strictObject({ operation: sessionOperationSchema }) }),
   z.strictObject({
     ...timelineEnvelope,
     type: z.literal("session_created"),

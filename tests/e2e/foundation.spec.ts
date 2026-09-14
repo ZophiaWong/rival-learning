@@ -116,7 +116,7 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
   await expect(checkpoint).toContainText("你的原回答摘录：人工补偿成本");
   await expect(checkpoint).toContainText("Benchmark 摘录：量化重复率");
   await expect(checkpoint).toContainText("Priority 1 · evidence_and_outcome · unreviewed");
-  await expect(checkpoint).toContainText("Step 5 才能校准");
+  await expect(checkpoint).toContainText("请逐项校准差距");
   await checkpoint.getByText("完整 Benchmark").first().click();
   await expect(checkpoint).toContainText("量化重复率、恢复时长和人工补偿成本");
   await checkpoint.getByText("五维 Rubric").first().click();
@@ -131,6 +131,24 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
   await expect(page.getByRole("button", { name: "inaccurate", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: /Rechallenge/ })).toHaveCount(0);
 
+  await checkpoint.getByRole("button", { name: "准确", exact: true }).first().click();
+  await expect(checkpoint.getByRole("button", { name: "不准确", exact: true })).toHaveCount(1);
+  await checkpoint.getByRole("button", { name: "不准确", exact: true }).click();
+  await page.getByRole("button", { name: "开始即时 Rechallenge", exact: true }).click();
+  const rechallenge = page.getByLabel("Rechallenge", { exact: true });
+  await expect(rechallenge).toContainText("支付服务");
+  await page.getByLabel("无提示作答", { exact: true }).fill("我会关注运行状态。");
+  await page.getByRole("button", { name: "提交 Rechallenge 回答", exact: true }).click();
+  await expect(rechallenge).toContainText("尚未覆盖目标维度");
+  await page.reload();
+  await page.getByRole("button", { name: "使用一次 L1 提示", exact: true }).click();
+  await page.getByLabel("提示后再作答", { exact: true }).fill("比较发布前后的支付失败率，固定同类流量和观测窗口。");
+  await page.getByRole("button", { name: "提交 Rechallenge 回答", exact: true }).click();
+  await expect(rechallenge).toContainText("结果：AssistedCorrection");
+  await expect(page.getByLabel("Session usage")).toContainText("/ 60");
+  await page.reload();
+  await expect(rechallenge).toContainText("结果：AssistedCorrection");
+
   const sessionTimeline = page.getByLabel("Session timeline");
   await expect(sessionTimeline.locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
   await expect(sessionTimeline.locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);
@@ -142,6 +160,7 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
     sessionCreateRequest?.body.sessionId,
   );
 
+  await page.getByRole("button", { name: "选择 Backend preparation", exact: true }).click();
   await page
     .getByLabel("Resume")
     .fill("Email: candidate@example.com\nBuilt the revised queue consumer and reduced failures by 40%.");
@@ -175,7 +194,7 @@ test("A2A Take Over path, refresh recovery, Profile reuse, and retained history"
   await expect(page.getByText(/我会比较重复处理风险/)).toBeVisible();
   await expect(page.getByText(/如果重复率或尾延迟持续越过阈值/)).toBeVisible();
   await expect(page.getByLabel("Checkpoint")).toContainText(
-    "Priority 1 · evidence_and_outcome · unreviewed",
+    "Priority 1 · evidence_and_outcome · accurate",
   );
   await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "question_presented" })).toHaveCount(3);
   await expect(page.getByLabel("Session timeline").locator("li").filter({ hasText: "answer_recorded" })).toHaveCount(3);

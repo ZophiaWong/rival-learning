@@ -1,3 +1,4 @@
+import { calibrationSchema } from "@/server/core-loop/learning";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
@@ -20,6 +21,16 @@ export const sessionCreateRequestSchema = z.strictObject({
 });
 
 export const sessionActionRequestSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("calibrate_finding"), findingId: z.string().min(1), calibration: calibrationSchema }),
+  z.strictObject({ type: z.literal("submit_rechallenge_answer"), answer: answerTextSchema }),
+  z.strictObject({ type: z.literal("add_reflection"), turnId: z.string().min(1), text: answerTextSchema }),
+  z.strictObject({ type: z.literal("prepare_rechallenge") }),
+  z.strictObject({ type: z.literal("evaluate_rechallenge") }),
+  z.strictObject({ type: z.literal("generate_hint") }),
+  z.strictObject({ type: z.literal("skip_rechallenge") }),
+  z.strictObject({ type: z.literal("finish_rechallenge") }),
+  z.strictObject({ type: z.literal("extend_budget") }),
+  z.strictObject({ type: z.literal("resume_error") }),
   z.strictObject({ type: z.literal("generate_plan") }),
   z.strictObject({ type: z.literal("start") }),
   z.strictObject({ type: z.literal("request_ai_answer") }),

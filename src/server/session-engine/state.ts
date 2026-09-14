@@ -1,3 +1,4 @@
+import { learningStateSchema, type LearningState } from "@/server/core-loop/learning";
 import { z } from "zod";
 
 import {
@@ -13,7 +14,7 @@ import {
 } from "@/server/core-loop/domain";
 import { coreLoopPolicySchema } from "@/server/core-loop/policy";
 
-export const sessionPhaseSchema = z.enum(["draft", "planned", "active", "error"]);
+export const sessionPhaseSchema = z.enum(["draft", "planned", "active", "error", "budget_paused"]);
 export type SessionPhase = z.infer<typeof sessionPhaseSchema>;
 
 export const sessionOperationSchema = z.enum([
@@ -22,6 +23,9 @@ export const sessionOperationSchema = z.enum([
   "request_ai_answer",
   "request_next_question",
   "generate_checkpoint",
+  "prepare_rechallenge",
+  "evaluate_rechallenge",
+  "generate_hint",
 ]);
 export type SessionOperation = z.infer<typeof sessionOperationSchema>;
 
@@ -36,13 +40,13 @@ export const activeOperationSchema = z.strictObject({
   type: sessionOperationSchema,
   token: z.string().min(1),
   idempotencyKey: z.string().min(1).max(128),
-  priorPhase: sessionPhaseSchema.exclude(["error"]),
+  priorPhase: sessionPhaseSchema.exclude(["error", "budget_paused"]),
   startedAt: z.iso.datetime(),
 });
 
 export const failedOperationSchema = z.strictObject({
   type: sessionOperationSchema,
-  priorPhase: sessionPhaseSchema.exclude(["error"]),
+  priorPhase: sessionPhaseSchema.exclude(["error", "budget_paused"]),
   operationToken: z.string().min(1),
   code: z.string().min(1),
   userMessage: z.string().min(1),
@@ -138,6 +142,8 @@ export const sessionStateV4Schema = z.strictObject({
   planRecord: interviewPlanRecordSchema.nullable(),
   execution: attackChainExecutionStateSchema.nullable(),
   checkpoint: checkpointWorkStateSchema.nullable(),
+  budgetLimit: z.number().int().min(60).default(60),
+  learning: learningStateSchema.default({ gaps: [], rechallenge: null }),
   activeOperation: activeOperationSchema.nullable(),
   failedOperation: failedOperationSchema.nullable(),
 });
@@ -184,6 +190,7 @@ export interface PublicSessionState {
     completion: NonNullable<SessionStateV4["execution"]>["completion"];
   } | null;
   checkpoint: PublicCheckpoint | null;
+  learning: LearningState;
   activeOperation: SessionOperation | null;
   failedOperation: Omit<FailedOperation, "operationToken" | "generation"> | null;
 }
@@ -191,6 +198,7 @@ export interface PublicSessionState {
 export function projectSessionState(state: SessionStateV4): PublicSessionState {
   return {
     interviewLanguage: state.interviewLanguage,
+    learning: state.learning,
     plan: state.planRecord?.plan ?? null,
     execution: state.execution
       ? {
